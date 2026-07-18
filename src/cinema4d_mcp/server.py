@@ -33,10 +33,13 @@ ACTIVE_TOOL_NAMES = (
     "get_object",
 )
 OBJECT_ID_PREFIX = "c4d:"
-UINT64_MAX = (1 << 64) - 1
 DOCUMENT_SCOPE_HEX_LENGTH = 32
+OBJECT_SCOPE_HEX_LENGTH = 32
 MAX_OBJECT_ID_LENGTH = (
-    len(OBJECT_ID_PREFIX) + DOCUMENT_SCOPE_HEX_LENGTH + 1 + len(str(UINT64_MAX))
+    len(OBJECT_ID_PREFIX)
+    + DOCUMENT_SCOPE_HEX_LENGTH
+    + 1
+    + OBJECT_SCOPE_HEX_LENGTH
 )
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 200
@@ -50,7 +53,7 @@ def _is_valid_object_id(value: Any) -> bool:
     parts = value.split(":")
     if len(parts) != 3 or parts[0] != "c4d":
         return False
-    document_scope, guid_text = parts[1], parts[2]
+    document_scope, object_scope = parts[1], parts[2]
     if (
         len(document_scope) != DOCUMENT_SCOPE_HEX_LENGTH
         or not document_scope.isascii()
@@ -58,14 +61,12 @@ def _is_valid_object_id(value: Any) -> bool:
     ):
         return False
     if (
-        not guid_text
-        or not guid_text.isascii()
-        or not guid_text.isdigit()
-        or guid_text[0] == "0"
+        len(object_scope) != OBJECT_SCOPE_HEX_LENGTH
+        or not object_scope.isascii()
+        or any(character not in "0123456789abcdef" for character in object_scope)
     ):
         return False
-    guid = int(guid_text)
-    return 1 <= guid <= UINT64_MAX
+    return True
 
 
 def _validated_list_params(params: Dict[str, Any]) -> Dict[str, Any]:

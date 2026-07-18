@@ -15,10 +15,15 @@ from tests.test_phase1_transport import TOKEN, load_plugin_module
 
 SCOPE_A = "a" * 32
 SCOPE_B = "b" * 32
+DEFAULT_EQUALITY = object()
 
 
-def object_id(guid, scope=SCOPE_A):
-    return "c4d:{}:{}".format(scope, guid)
+def object_scope(value):
+    return "{:032x}".format(value) if isinstance(value, int) else str(value)
+
+
+def object_id(value, scope=SCOPE_A):
+    return "c4d:{}:{}".format(scope, object_scope(value))
 
 
 class FakeVector:
@@ -42,6 +47,11 @@ class FakeObject:
         rotation=None,
         scale=None,
         children=None,
+        atom_key=None,
+        alive=True,
+        equality_error=False,
+        equality_result=DEFAULT_EQUALITY,
+        liveness_error=False,
     ):
         self.guid = guid
         self.name = name
@@ -54,8 +64,33 @@ class FakeObject:
         self._down = None
         self._next = None
         self.cache_reads = 0
+        self.guid_reads = 0
+        self.atom_key = atom_key if atom_key is not None else object()
+        self.alive = alive
+        self.equality_error = equality_error
+        self.equality_result = equality_result
+        self.liveness_error = liveness_error
+
+    def __eq__(self, other):
+        if self.equality_error:
+            raise RuntimeError("C4DAtom equality failed")
+        if self.equality_result is not DEFAULT_EQUALITY:
+            return self.equality_result
+        return (
+            isinstance(other, FakeObject)
+            and self.atom_key == other.atom_key
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def IsAlive(self):
+        if self.liveness_error:
+            raise RuntimeError("C4DAtom liveness failed")
+        return self.alive
 
     def GetGUID(self):
+        self.guid_reads += 1
         if isinstance(self.guid, Exception):
             raise self.guid
         return self.guid
@@ -167,6 +202,10 @@ class Phase2AReadContractTests(unittest.TestCase):
         self.plugin._DOCUMENT_SCOPES = self.plugin._DocumentScopeRegistry(
             token_factory=lambda: next(scope_tokens)
         )
+        object_scope_tokens = iter(object_scope(index) for index in range(1, 4096))
+        self.plugin._OBJECT_SCOPES = self.plugin._ObjectScopeRegistry(
+            token_factory=lambda: next(object_scope_tokens)
+        )
         self.plugin.c4d.documents = SimpleNamespace(
             GetActiveDocument=lambda: self.document
         )
@@ -264,7 +303,7 @@ class Phase2AReadContractTests(unittest.TestCase):
         self.assertEqual(result["object_count"], 3)
         self.assertEqual(
             result["active_object_ids"],
-            [object_id(101), object_id(103)],
+            [object_id(1), object_id(3)],
         )
 
     def test_no_active_document_is_structured(self):
@@ -320,18 +359,18 @@ class Phase2AReadContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item["object_id"] for item in objects],
-            [object_id(guid) for guid in (101, 102, 103, 104, 105)],
+            [object_id(index) for index in range(1, 6)],
         )
         self.assertEqual([item["depth"] for item in objects], [0, 1, 2, 1, 0])
         self.assertEqual(
             [item["parent_id"] for item in objects],
-            [None, object_id(101), object_id(102), object_id(101), None],
+            [None, object_id(1), object_id(2), object_id(1), None],
         )
         duplicates = [item for item in objects if item["name"] == "Duplicate"]
         self.assertEqual(len(duplicates), 2)
         self.assertNotEqual(duplicates[0]["object_id"], duplicates[1]["object_id"])
 
-    def test_unavailable_and_duplicate_guids_are_not_addressable(self):
+    def test_guid_availability_and_duplicates_do_not_control_identity(self):
         missing = FakeObject(None, "Missing", 710001, "Fake")
         broken = FakeObject(RuntimeError("no marker"), "Broken", 710002, "Fake")
         duplicate_a = FakeObject(500, "A", 710003, "Fake")
@@ -343,21 +382,12 @@ class Phase2AReadContractTests(unittest.TestCase):
         objects = self.dispatch("list_objects")["objects"]
 
         by_name = {item["name"]: item for item in objects}
-        for item in (
-            by_name["Missing"],
-            by_name["Broken"],
-            by_name["A"],
-            by_name["B"],
-        ):
-            self.assertIsNone(item["object_id"])
-            self.assertFalse(item["addressable"])
-            self.assertEqual(item["id_error"], "OBJECT_ID_UNAVAILABLE")
-        self.assertEqual(by_name["Child"]["object_id"], object_id(501))
-        self.assertIsNone(by_name["Child"]["parent_id"])
-        self.assertEqual(
-            by_name["Child"]["parent_id_error"],
-            "OBJECT_ID_UNAVAILABLE",
-        )
+        self.assertTrue(all(item["addressable"] for item in objects))
+        self.assertEqual(len({item["object_id"] for item in objects}), 5)
+        self.assertEqual(by_name["Missing"]["object_id"], object_id(1))
+        self.assertEqual(by_name["Child"]["object_id"], object_id(2))
+        self.assertEqual(by_name["Child"]["parent_id"], object_id(1))
+        self.assertNotEqual(by_name["A"]["object_id"], by_name["B"]["object_id"])
 
     def test_type_name_failure_is_null_not_a_guess(self):
         obj = FakeObject(101, "Object", 720001, RuntimeError("unavailable"))
@@ -376,7 +406,7 @@ class Phase2AReadContractTests(unittest.TestCase):
 
         objects = self.dispatch("list_objects")["objects"]
 
-        self.assertEqual([item["object_id"] for item in objects], [object_id(101)])
+        self.assertEqual([item["object_id"] for item in objects], [object_id(1)])
         self.assertEqual(root.cache_reads, 0)
 
     def test_get_object_returns_runtime_type_relative_hpb_and_direct_children(self):
@@ -395,15 +425,16 @@ class Phase2AReadContractTests(unittest.TestCase):
         )
         parent = FakeObject(100, "Parent", 740000, "Fake", children=[target])
         self.document = FakeDocument([parent])
-        self.dispatch("list_objects")
+        listed = self.dispatch("list_objects")["objects"]
+        by_name = {item["name"]: item["object_id"] for item in listed}
 
-        result = self.dispatch("get_object", {"object_id": object_id(101)})
+        result = self.dispatch("get_object", {"object_id": by_name["Target"]})
 
-        self.assertEqual(result["object_id"], object_id(101))
+        self.assertEqual(result["object_id"], object_id(2))
         self.assertEqual(result["type_id"], 740001)
         self.assertEqual(result["type_name"], "Runtime Type Name")
-        self.assertEqual(result["parent_id"], object_id(100))
-        self.assertEqual(result["children"], [object_id(102), object_id(103)])
+        self.assertEqual(result["parent_id"], object_id(1))
+        self.assertEqual(result["children"], [object_id(3), object_id(5)])
         self.assertEqual(result["child_count"], 2)
         self.assertEqual(result["addressable_child_count"], 2)
         self.assertEqual(result["unaddressable_child_count"], 0)
@@ -417,10 +448,14 @@ class Phase2AReadContractTests(unittest.TestCase):
         first = FakeObject(101, "Cube", 750001, "Fake Cube")
         second = FakeObject(102, "Cube", 750002, "Fake Cube")
         self.document = FakeDocument([first, second])
-        self.dispatch("list_objects")
+        listed = self.dispatch("list_objects")["objects"]
 
-        first_result = self.dispatch("get_object", {"object_id": object_id(101)})
-        second_result = self.dispatch("get_object", {"object_id": object_id(102)})
+        first_result = self.dispatch(
+            "get_object", {"object_id": listed[0]["object_id"]}
+        )
+        second_result = self.dispatch(
+            "get_object", {"object_id": listed[1]["object_id"]}
+        )
 
         self.assertEqual(first_result["type_id"], 750001)
         self.assertEqual(second_result["type_id"], 750002)
@@ -437,22 +472,22 @@ class Phase2AReadContractTests(unittest.TestCase):
         second_id = self.dispatch("list_objects")["objects"][0]["object_id"]
         second_get = self.dispatch("get_object", {"object_id": second_id})
 
-        self.assertEqual(first_id, object_id(123456789))
+        self.assertEqual(first_id, object_id(1))
         self.assertEqual(second_id, first_id)
         self.assertEqual(first_get["name"], "Before")
         self.assertEqual(second_get["name"], "After")
 
-    def test_unknown_and_non_unique_object_ids_have_distinct_errors(self):
+    def test_unknown_scope_is_stale_and_duplicate_guids_remain_distinct(self):
         duplicate_a = FakeObject(500, "A", 760001, "Fake")
         duplicate_b = FakeObject(500, "B", 760002, "Fake")
         self.document = FakeDocument([duplicate_a, duplicate_b])
-        self.dispatch("list_objects")
+        listed = self.dispatch("list_objects")["objects"]
 
         missing = self.execute_task("get_object", {"object_id": object_id(999)})
-        duplicate = self.execute_task("get_object", {"object_id": object_id(500)})
 
-        self.assertEqual(missing["error"]["code"], "OBJECT_NOT_FOUND")
-        self.assertEqual(duplicate["error"]["code"], "OBJECT_ID_UNAVAILABLE")
+        self.assertEqual(missing["error"]["code"], "STALE_OBJECT_ID")
+        self.assertTrue(all(item["addressable"] for item in listed))
+        self.assertNotEqual(listed[0]["object_id"], listed[1]["object_id"])
 
     def test_request_validation_accepts_only_command_specific_params(self):
         server = self.make_server()

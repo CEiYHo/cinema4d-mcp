@@ -37,9 +37,10 @@ DEFAULT_MAIN_THREAD_TIMEOUT = 5.0
 MAX_RESPONSE_FRAME_BYTES = 64 * 1024
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 200
-UINT64_MAX = (1 << 64) - 1
 DOCUMENT_SCOPE_BYTES = 16
 DOCUMENT_SCOPE_HEX_LENGTH = DOCUMENT_SCOPE_BYTES * 2
+OBJECT_SCOPE_BYTES = 16
+OBJECT_SCOPE_HEX_LENGTH = OBJECT_SCOPE_BYTES * 2
 ACTIVE_COMMAND_NAMES = (
     "ping",
     "get_capabilities",
@@ -50,7 +51,10 @@ ACTIVE_COMMAND_NAMES = (
 ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
 OBJECT_ID_PREFIX = "c4d:"
 MAX_OBJECT_ID_LENGTH = (
-    len(OBJECT_ID_PREFIX) + DOCUMENT_SCOPE_HEX_LENGTH + 1 + len(str(UINT64_MAX))
+    len(OBJECT_ID_PREFIX)
+    + DOCUMENT_SCOPE_HEX_LENGTH
+    + 1
+    + OBJECT_SCOPE_HEX_LENGTH
 )
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
@@ -182,63 +186,58 @@ def _is_valid_document_scope(value):
     )
 
 
+def _is_valid_object_scope(value):
+    return (
+        isinstance(value, str)
+        and len(value) == OBJECT_SCOPE_HEX_LENGTH
+        and value.isascii()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _parse_object_id(value):
     if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
         return None
     parts = value.split(":")
     if len(parts) != 3 or parts[0] != "c4d":
         return None
-    document_scope, guid_text = parts[1], parts[2]
+    document_scope, object_scope = parts[1], parts[2]
     if not _is_valid_document_scope(document_scope):
         return None
-    if (
-        not guid_text
-        or not guid_text.isascii()
-        or not guid_text.isdigit()
-        or guid_text[0] == "0"
-    ):
+    if not _is_valid_object_scope(object_scope):
         return None
-    guid = int(guid_text)
-    if not 1 <= guid <= UINT64_MAX:
-        return None
-    return document_scope, guid
+    return document_scope, object_scope
 
 
 def _is_valid_object_id(value):
     return _parse_object_id(value) is not None
 
 
-def _object_guid_or_none(obj):
-    """Read the documented UInt64 GUID without normalizing invalid values."""
-    try:
-        guid = obj.GetGUID()
-    except Exception:
-        return None
-    if (
-        isinstance(guid, bool)
-        or not isinstance(guid, int)
-        or not 1 <= guid <= UINT64_MAX
-    ):
-        return None
-    return guid
-
-
-def _serialize_object_id(document_scope, guid):
+def _serialize_object_id(document_scope, object_scope):
     if not _is_valid_document_scope(document_scope):
         raise ValueError("invalid document scope")
-    if isinstance(guid, bool) or not isinstance(guid, int):
-        raise ValueError("invalid object GUID")
-    value = "{}{}:{}".format(OBJECT_ID_PREFIX, document_scope, guid)
-    if _parse_object_id(value) != (document_scope, guid):
-        raise ValueError("invalid object GUID")
+    if not _is_valid_object_scope(object_scope):
+        raise ValueError("invalid object scope")
+    value = "{}{}:{}".format(OBJECT_ID_PREFIX, document_scope, object_scope)
+    if _parse_object_id(value) != (document_scope, object_scope):
+        raise ValueError("invalid object scope")
     return value
 
 
-def _object_id_or_none(obj, document_scope):
-    guid = _object_guid_or_none(obj)
-    if guid is None:
+def _atom_liveness(atom):
+    try:
+        alive = atom.IsAlive()
+    except Exception:
         return None
-    return _serialize_object_id(document_scope, guid)
+    return alive if isinstance(alive, bool) else None
+
+
+def _same_atom(left, right):
+    try:
+        same = left == right
+    except Exception:
+        return None
+    return same if isinstance(same, bool) else None
 
 
 class _DocumentScopeRegistry:
@@ -255,33 +254,17 @@ class _DocumentScopeRegistry:
         )
         self._documents = {}
 
-    @staticmethod
-    def _is_alive(doc):
-        try:
-            alive = doc.IsAlive()
-        except Exception:
-            return False
-        return alive is True
-
-    @staticmethod
-    def _same_atom(left, right):
-        try:
-            same = left == right
-        except Exception:
-            return None
-        return same if isinstance(same, bool) else None
-
     def _prune_dead(self):
         for document_scope, registered_doc in list(self._documents.items()):
-            if not self._is_alive(registered_doc):
+            if _atom_liveness(registered_doc) is not True:
                 del self._documents[document_scope]
 
     def scope_for(self, doc):
-        if not self._is_alive(doc):
+        if _atom_liveness(doc) is not True:
             raise RuntimeError("Active document is not a live C4DAtom")
         self._prune_dead()
         for document_scope, registered_doc in self._documents.items():
-            if self._same_atom(registered_doc, doc) is True:
+            if _same_atom(registered_doc, doc) is True:
                 return document_scope
         for _ in range(16):
             document_scope = self._token_factory()
@@ -298,17 +281,112 @@ class _DocumentScopeRegistry:
         registered_doc = self._documents.get(document_scope)
         if registered_doc is None:
             return "stale"
-        if not self._is_alive(doc):
+        if _atom_liveness(doc) is not True:
             return "unverified"
-        same = self._same_atom(registered_doc, doc)
+        same = _same_atom(registered_doc, doc)
         if same is True:
             return "current"
         if same is False:
             return "mismatch"
         return "unverified"
 
+    def live_scopes(self):
+        self._prune_dead()
+        return frozenset(self._documents)
+
 
 _DOCUMENT_SCOPES = _DocumentScopeRegistry()
+
+
+class _ObjectScopeRegistry:
+    """Bind random scopes to live BaseObject atoms within each document."""
+
+    def __init__(self, token_factory=None):
+        self._token_factory = token_factory or (
+            lambda: secrets.token_hex(OBJECT_SCOPE_BYTES)
+        )
+        self._objects = {}
+        self._issued_scopes = set()
+
+    def retain_documents(self, document_scopes):
+        for document_scope in list(self._objects):
+            if document_scope not in document_scopes:
+                del self._objects[document_scope]
+
+    def _prune_dead(self, document_scope):
+        bucket = self._objects.get(document_scope)
+        if not bucket:
+            return
+        for object_scope, registered_obj in list(bucket.items()):
+            if _atom_liveness(registered_obj) is False:
+                del bucket[object_scope]
+        if not bucket:
+            self._objects.pop(document_scope, None)
+
+    def scope_for(self, document_scope, obj):
+        liveness = _atom_liveness(obj)
+        if liveness is False:
+            return None, "OBJECT_ID_UNAVAILABLE"
+        if liveness is not True:
+            return None, "OBJECT_ID_UNVERIFIED"
+
+        self._prune_dead(document_scope)
+        bucket = self._objects.setdefault(document_scope, {})
+        matching_scopes = []
+        comparison_unverified = False
+        for object_scope, registered_obj in bucket.items():
+            if _atom_liveness(registered_obj) is not True:
+                comparison_unverified = True
+                continue
+            same = _same_atom(registered_obj, obj)
+            if same is True:
+                matching_scopes.append(object_scope)
+            elif same is None:
+                comparison_unverified = True
+
+        if comparison_unverified or len(matching_scopes) > 1:
+            return None, "OBJECT_ID_UNVERIFIED"
+        if matching_scopes:
+            return matching_scopes[0], None
+
+        for _ in range(16):
+            try:
+                object_scope = self._token_factory()
+            except Exception:
+                return None, "OBJECT_ID_UNAVAILABLE"
+            if (
+                _is_valid_object_scope(object_scope)
+                and object_scope not in self._issued_scopes
+            ):
+                self._issued_scopes.add(object_scope)
+                bucket[object_scope] = obj
+                return object_scope, None
+        return None, "OBJECT_ID_UNAVAILABLE"
+
+    def lookup(self, document_scope, object_scope):
+        self._prune_dead(document_scope)
+        bucket = self._objects.get(document_scope)
+        if not bucket:
+            return None, "stale"
+        registered_obj = bucket.get(object_scope)
+        if registered_obj is None:
+            return None, "stale"
+        liveness = _atom_liveness(registered_obj)
+        if liveness is False:
+            del bucket[object_scope]
+            if not bucket:
+                self._objects.pop(document_scope, None)
+            return None, "stale"
+        if liveness is not True:
+            return None, "unverified"
+        return registered_obj, "live"
+
+
+_OBJECT_SCOPES = _ObjectScopeRegistry()
+
+
+def _sync_object_document_buckets():
+    _OBJECT_SCOPES.retain_documents(_DOCUMENT_SCOPES.live_scopes())
 
 
 def _walk_document_hierarchy(doc):
@@ -336,23 +414,45 @@ def _walk_document_hierarchy(doc):
     return entries
 
 
-def _build_identity_snapshot(doc, document_scope=None):
+def _build_identity_snapshot(doc, document_scope=None, entries=None):
     document_scope = document_scope or _DOCUMENT_SCOPES.scope_for(doc)
-    entries = _walk_document_hierarchy(doc)
+    _sync_object_document_buckets()
+    entries = entries if entries is not None else _walk_document_hierarchy(doc)
     counts = {}
     for entry in entries:
-        candidate = _object_id_or_none(entry["object"], document_scope)
+        object_scope, id_error = _OBJECT_SCOPES.scope_for(
+            document_scope,
+            entry["object"],
+        )
+        candidate = (
+            _serialize_object_id(document_scope, object_scope)
+            if object_scope is not None
+            else None
+        )
         entry["candidate_id"] = candidate
+        entry["id_error"] = id_error
         if candidate is not None:
             counts[candidate] = counts.get(candidate, 0) + 1
 
     identity_by_object = {}
+    identity_error_by_object = {}
     for entry in entries:
         candidate = entry["candidate_id"]
-        identity_by_object[id(entry["object"])] = (
-            candidate if candidate is not None and counts[candidate] == 1 else None
-        )
-    return entries, identity_by_object, document_scope
+        wrapper_key = id(entry["object"])
+        if candidate is not None and counts[candidate] == 1:
+            identity_by_object[wrapper_key] = candidate
+            identity_error_by_object[wrapper_key] = None
+        else:
+            identity_by_object[wrapper_key] = None
+            identity_error_by_object[wrapper_key] = (
+                entry["id_error"] or "OBJECT_ID_UNVERIFIED"
+            )
+    return (
+        entries,
+        identity_by_object,
+        identity_error_by_object,
+        document_scope,
+    )
 
 
 def _safe_type_name(obj):
@@ -377,7 +477,7 @@ def _runtime_type_id(obj):
     return type_id
 
 
-def _object_summary(entry, identity_by_object):
+def _object_summary(entry, identity_by_object, identity_error_by_object):
     obj = entry["object"]
     parent = entry["parent"]
     object_id = identity_by_object[id(obj)]
@@ -394,15 +494,16 @@ def _object_summary(entry, identity_by_object):
         "depth": entry["depth"],
     }
     if object_id is None:
-        result["id_error"] = "OBJECT_ID_UNAVAILABLE"
+        result["id_error"] = identity_error_by_object[id(obj)]
     if parent is not None and parent_id is None:
-        result["parent_id_error"] = "OBJECT_ID_UNAVAILABLE"
+        result["parent_id_error"] = identity_error_by_object[id(parent)]
     return result
 
 
 def _require_active_document():
     doc = c4d.documents.GetActiveDocument()
     if doc is None:
+        _sync_object_document_buckets()
         raise _BridgeCommandError(
             "NO_ACTIVE_DOCUMENT",
             "Cinema 4D has no active document",
@@ -411,24 +512,29 @@ def _require_active_document():
 
 
 def _read_scene_info(doc):
-    entries, identity_by_object, document_scope = _build_identity_snapshot(doc)
+    (
+        entries,
+        identity_by_object,
+        _,
+        _,
+    ) = _build_identity_snapshot(doc)
     name = doc.GetDocumentName()
     path = doc.GetDocumentPath()
     if not isinstance(name, str) or not isinstance(path, str):
         raise RuntimeError("Cinema 4D returned invalid document metadata")
 
-    active_candidates = set()
     active_objects = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
-    for obj in active_objects or []:
-        candidate = _object_id_or_none(obj, document_scope)
-        if candidate is not None:
-            active_candidates.add(candidate)
-
     active_object_ids = []
     for entry in entries:
         object_id = identity_by_object[id(entry["object"])]
-        if object_id is not None and object_id in active_candidates:
-            active_object_ids.append(object_id)
+        if object_id is None:
+            continue
+        for active_obj in active_objects or []:
+            if _atom_liveness(active_obj) is not True:
+                continue
+            if _same_atom(entry["object"], active_obj) is True:
+                active_object_ids.append(object_id)
+                break
 
     return {
         "document": {
@@ -490,12 +596,21 @@ def _read_object_list(doc, params, request_id):
     pagination = _validated_list_params(params)
     offset = pagination["offset"]
     limit = pagination["limit"]
-    entries, identity_by_object, _ = _build_identity_snapshot(doc)
+    (
+        entries,
+        identity_by_object,
+        identity_error_by_object,
+        _,
+    ) = _build_identity_snapshot(doc)
     total_count = len(entries)
     objects = []
 
     for absolute_index in range(offset, min(total_count, offset + limit)):
-        summary = _object_summary(entries[absolute_index], identity_by_object)
+        summary = _object_summary(
+            entries[absolute_index],
+            identity_by_object,
+            identity_error_by_object,
+        )
         tentative = objects + [summary]
         result = _list_page_result(tentative, total_count, offset, limit)
         frame = _serialize_response_frame(_success_envelope(request_id, result))
@@ -549,8 +664,9 @@ def _read_object(doc, object_id):
             "INVALID_PARAMS",
             "get_object requires one canonical object_id",
         )
-    document_scope, _ = parsed
+    document_scope, object_scope = parsed
     scope_status = _DOCUMENT_SCOPES.status(doc, document_scope)
+    _sync_object_document_buckets()
     if scope_status == "stale":
         raise _BridgeCommandError(
             "STALE_OBJECT_ID",
@@ -567,25 +683,68 @@ def _read_object(doc, object_id):
             "The active document identity could not be verified",
         )
 
-    entries, identity_by_object, _ = _build_identity_snapshot(
-        doc,
+    registered_obj, object_status = _OBJECT_SCOPES.lookup(
         document_scope,
+        object_scope,
     )
-    matches = [
-        entry for entry in entries if entry["candidate_id"] == object_id
-    ]
-    if not matches:
+    if object_status == "stale":
         raise _BridgeCommandError(
-            "OBJECT_NOT_FOUND",
-            "No object with that object_id exists in the active document",
+            "STALE_OBJECT_ID",
+            "The object scope is no longer live in this plugin process session",
         )
-    if len(matches) != 1 or identity_by_object[id(matches[0]["object"])] is None:
+    if object_status == "unverified":
         raise _BridgeCommandError(
-            "OBJECT_ID_UNAVAILABLE",
-            "The object_id is not uniquely addressable in the active document",
+            "OBJECT_ID_UNVERIFIED",
+            "The registered object liveness could not be verified",
         )
 
+    entries = _walk_document_hierarchy(doc)
+    matches = []
+    comparison_unverified = False
+    for entry in entries:
+        current_obj = entry["object"]
+        if _atom_liveness(current_obj) is not True:
+            comparison_unverified = True
+            continue
+        same = _same_atom(registered_obj, current_obj)
+        if same is True:
+            matches.append(entry)
+        elif same is None:
+            comparison_unverified = True
+
+    if comparison_unverified:
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "The object identity could not be verified in the active hierarchy",
+        )
+    if not matches:
+        raise _BridgeCommandError(
+            "OBJECT_NOT_IN_DOCUMENT",
+            "The live object is no longer in the active document hierarchy",
+        )
+    if len(matches) != 1:
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "The object identity matched multiple hierarchy entries",
+        )
+
+    (
+        entries,
+        identity_by_object,
+        identity_error_by_object,
+        _,
+    ) = _build_identity_snapshot(
+        doc,
+        document_scope,
+        entries,
+    )
     entry = matches[0]
+    if identity_by_object[id(entry["object"])] != object_id:
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "The object scope could not be confirmed in the active hierarchy",
+        )
+
     obj = entry["object"]
     parent = entry["parent"]
     parent_id = (
@@ -626,7 +785,7 @@ def _read_object(doc, object_id):
         "children_complete": child_count == addressable_child_count,
     }
     if parent is not None and parent_id is None:
-        result["parent_id_error"] = "OBJECT_ID_UNAVAILABLE"
+        result["parent_id_error"] = identity_error_by_object[id(parent)]
     return result
 
 

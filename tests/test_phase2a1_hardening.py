@@ -13,9 +13,11 @@ from tests.test_phase1_transport import TOKEN, load_plugin_module
 from tests.test_phase2a_read import (
     FakeDocument,
     FakeObject,
+    FakeVector,
     SCOPE_A,
     SCOPE_B,
     object_id,
+    object_scope,
 )
 
 
@@ -29,6 +31,10 @@ class Phase2A1HardeningTests(unittest.TestCase):
         scope_tokens = iter((SCOPE_A, SCOPE_B, "c" * 32, "d" * 32))
         self.plugin._DOCUMENT_SCOPES = self.plugin._DocumentScopeRegistry(
             token_factory=lambda: next(scope_tokens)
+        )
+        object_scope_tokens = iter(object_scope(index) for index in range(1, 4096))
+        self.plugin._OBJECT_SCOPES = self.plugin._ObjectScopeRegistry(
+            token_factory=lambda: next(object_scope_tokens)
         )
         self.plugin.c4d.documents = SimpleNamespace(
             GetActiveDocument=lambda: self.document
@@ -409,6 +415,7 @@ class Phase2A1HardeningTests(unittest.TestCase):
 
         self.assertEqual(response["error"]["code"], "STALE_OBJECT_ID")
         self.assertNotIn(SCOPE_A, self.plugin._DOCUMENT_SCOPES._documents)
+        self.assertNotIn(SCOPE_A, self.plugin._OBJECT_SCOPES._objects)
 
     def test_liveness_exception_prunes_scope_fail_closed(self):
         document_a = FakeDocument([FakeObject(77, "Closed", 851011, "Fake")])
@@ -421,6 +428,20 @@ class Phase2A1HardeningTests(unittest.TestCase):
 
         self.assertEqual(response["error"]["code"], "STALE_OBJECT_ID")
         self.assertNotIn(SCOPE_A, self.plugin._DOCUMENT_SCOPES._documents)
+        self.assertNotIn(SCOPE_A, self.plugin._OBJECT_SCOPES._objects)
+
+    def test_no_active_document_prunes_closed_document_object_bucket(self):
+        document = FakeDocument([FakeObject(0, "Closed", 851021, "Cube")])
+        self.document = document
+        self.dispatch("list_objects")
+        self.assertIn(SCOPE_A, self.plugin._OBJECT_SCOPES._objects)
+        document.alive = False
+        self.document = None
+
+        response = self.execute_task("get_scene_info")
+
+        self.assertEqual(response["error"]["code"], "NO_ACTIVE_DOCUMENT")
+        self.assertNotIn(SCOPE_A, self.plugin._OBJECT_SCOPES._objects)
 
     def test_equality_exception_never_matches_document_scope(self):
         first_wrapper = FakeDocument(equality_error=True)
@@ -451,44 +472,241 @@ class Phase2A1HardeningTests(unittest.TestCase):
             "DOCUMENT_ID_UNVERIFIED",
         )
 
-    def test_document_scoped_uint64_object_id_is_strictly_canonical(self):
+    def test_document_and_object_scopes_are_strictly_canonical(self):
         valid = (
             object_id(1),
             object_id(123),
-            object_id(self.plugin.UINT64_MAX),
+            object_id("f" * 32),
         )
         invalid = (
-            "c4d:{}:0".format(SCOPE_A),
-            "c4d:{}:-1".format(SCOPE_A),
-            "c4d:{}:+1".format(SCOPE_A),
-            "c4d:{}:01".format(SCOPE_A),
-            "c4d:{}:{}".format(SCOPE_A, self.plugin.UINT64_MAX + 1),
-            "c4d:{}:1".format(SCOPE_A.upper()),
-            "c4d:1",
+            "c4d:",
+            "c4d:abc:def",
+            "c4d:{}".format(SCOPE_A),
+            "c4d:{}:123".format(SCOPE_A),
+            "c4d:{}:{}".format(SCOPE_A.upper(), object_scope(1)),
+            "c4d:{}:{}".format(SCOPE_A, "A" * 32),
+            "c4d:{}:{}:extra".format(SCOPE_A, object_scope(1)),
+            " c4d:{}:{}".format(SCOPE_A, object_scope(1)),
+            "c4d:{}:{} ".format(SCOPE_A, object_scope(1)),
+            "c4d:{}:{}".format(SCOPE_A, "g" * 32),
         )
         for value in valid:
             self.assertTrue(self.plugin._is_valid_object_id(value), value)
         for value in invalid:
             self.assertFalse(self.plugin._is_valid_object_id(value), value)
 
-        for guid in (1, 123, self.plugin.UINT64_MAX):
-            serialized = self.plugin._serialize_object_id(SCOPE_A, guid)
+        for scope in (object_scope(1), object_scope(123), "f" * 32):
+            serialized = self.plugin._serialize_object_id(SCOPE_A, scope)
             self.assertEqual(
                 self.plugin._parse_object_id(serialized),
-                (SCOPE_A, guid),
+                (SCOPE_A, scope),
             )
 
-    def test_invalid_getguid_values_are_unaddressable(self):
-        for guid in (
-            False,
-            "1",
-            0,
-            -1,
-            self.plugin.UINT64_MAX + 1,
-        ):
+    def test_normal_objects_do_not_require_a_guid_for_addressing(self):
+        for guid in (0, None, RuntimeError("GetGUID unavailable")):
             with self.subTest(guid=guid):
-                obj = FakeObject(guid, "Invalid", 860001, "Fake")
-                self.assertIsNone(self.plugin._object_guid_or_none(obj))
+                self.setUp()
+                obj = FakeObject(guid, "Cube", 860001, "Cube")
+                self.document = FakeDocument([obj])
+
+                summary = self.dispatch("list_objects")["objects"][0]
+
+                self.assertTrue(summary["addressable"])
+                self.assertIsNotNone(summary["object_id"])
+                self.assertEqual(obj.guid_reads, 0)
+
+    def test_object_registry_reuses_scope_for_same_and_equivalent_wrappers(self):
+        atom_key = object()
+        first_wrapper = FakeObject(
+            None, "Cube", 860101, "Cube", atom_key=atom_key
+        )
+        second_wrapper = FakeObject(
+            None, "Cube", 860101, "Cube", atom_key=atom_key
+        )
+
+        first_scope, first_error = self.plugin._OBJECT_SCOPES.scope_for(
+            SCOPE_A, first_wrapper
+        )
+        repeated_scope, repeated_error = self.plugin._OBJECT_SCOPES.scope_for(
+            SCOPE_A, first_wrapper
+        )
+        equivalent_scope, equivalent_error = self.plugin._OBJECT_SCOPES.scope_for(
+            SCOPE_A, second_wrapper
+        )
+
+        self.assertIsNot(first_wrapper, second_wrapper)
+        self.assertTrue(first_wrapper == second_wrapper)
+        self.assertIsNone(first_error)
+        self.assertIsNone(repeated_error)
+        self.assertIsNone(equivalent_error)
+        self.assertEqual(repeated_scope, first_scope)
+        self.assertEqual(equivalent_scope, first_scope)
+
+    def test_different_object_wrappers_preserve_list_get_identity(self):
+        document_atom = object()
+        object_atom = object()
+        first_object = FakeObject(
+            0, "Cube", 860201, "Cube", atom_key=object_atom
+        )
+        second_object = FakeObject(
+            None, "Cube", 860201, "Cube", atom_key=object_atom
+        )
+        first_document = FakeDocument(
+            [first_object], atom_key=document_atom
+        )
+        second_document = FakeDocument(
+            [second_object], atom_key=document_atom
+        )
+
+        self.document = first_document
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        self.document = second_document
+        fetched = self.execute_task("get_object", {"object_id": issued_id})
+        repeated_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        fetched_again = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertTrue(fetched["ok"])
+        self.assertTrue(fetched_again["ok"])
+        self.assertEqual(repeated_id, issued_id)
+        self.assertEqual(first_object.guid_reads, 0)
+        self.assertEqual(second_object.guid_reads, 0)
+
+    def test_rename_and_transform_change_preserve_object_id(self):
+        obj = FakeObject(0, "Cube", 860301, "Cube")
+        self.document = FakeDocument([obj])
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+
+        obj.name = "Cube Renamed"
+        obj.position = FakeVector(10.0, 20.0, 30.0)
+        obj.rotation = FakeVector(math.pi / 2.0, 0.0, -math.pi / 4.0)
+        obj.scale = FakeVector(2.0, 3.0, 4.0)
+        repeated_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        result = self.dispatch("get_object", {"object_id": issued_id})
+
+        self.assertEqual(repeated_id, issued_id)
+        self.assertEqual(result["object_id"], issued_id)
+        self.assertEqual(result["name"], "Cube Renamed")
+        self.assertEqual(result["transform"]["position"], [10.0, 20.0, 30.0])
+        self.assertEqual(result["transform"]["rotation_deg"], [90.0, 0.0, -45.0])
+        self.assertEqual(result["transform"]["scale"], [2.0, 3.0, 4.0])
+
+    def test_same_name_type_and_guid_do_not_merge_distinct_atoms(self):
+        first = FakeObject(0, "Cube", 860401, "Cube")
+        second = FakeObject(0, "Cube", 860401, "Cube")
+        self.document = FakeDocument([first, second])
+
+        objects = self.dispatch("list_objects")["objects"]
+
+        self.assertTrue(all(item["addressable"] for item in objects))
+        self.assertNotEqual(objects[0]["object_id"], objects[1]["object_id"])
+        self.assertEqual(first.guid_reads, 0)
+        self.assertEqual(second.guid_reads, 0)
+
+    def test_dead_object_scope_is_stale_removed_and_never_reused(self):
+        obj = FakeObject(0, "Deleted", 860501, "Cube")
+        self.document = FakeDocument([obj])
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        issued_scope = self.plugin._parse_object_id(issued_id)[1]
+
+        obj.alive = False
+        self.document.roots = []
+        stale = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
+        self.assertNotIn(
+            issued_scope,
+            self.plugin._OBJECT_SCOPES._objects.get(SCOPE_A, {}),
+        )
+
+        replacement = FakeObject(0, "Replacement", 860502, "Cube")
+        self.document.roots = [replacement]
+        replacement_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        self.assertNotEqual(replacement_id, issued_id)
+        self.assertIn(issued_scope, self.plugin._OBJECT_SCOPES._issued_scopes)
+
+    def test_live_registered_object_outside_hierarchy_fails_closed(self):
+        obj = FakeObject(0, "Detached", 860601, "Cube")
+        self.document = FakeDocument([obj])
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        self.document.roots = []
+
+        response = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertEqual(response["error"]["code"], "OBJECT_NOT_IN_DOCUMENT")
+
+    def test_object_equality_exception_and_non_bool_fail_closed(self):
+        for equality_result in (RuntimeError("equality failed"), 1):
+            with self.subTest(equality_result=equality_result):
+                self.setUp()
+                document_atom = object()
+                object_atom = object()
+                registered = FakeObject(
+                    0, "Registered", 860701, "Cube", atom_key=object_atom
+                )
+                self.document = FakeDocument(
+                    [registered], atom_key=document_atom
+                )
+                issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+
+                current = FakeObject(
+                    0, "Current", 860701, "Cube", atom_key=object_atom
+                )
+                self.document = FakeDocument([current], atom_key=document_atom)
+                if isinstance(equality_result, Exception):
+                    registered.equality_error = True
+                else:
+                    registered.equality_result = equality_result
+
+                response = self.execute_task(
+                    "get_object", {"object_id": issued_id}
+                )
+
+                self.assertEqual(
+                    response["error"]["code"], "OBJECT_ID_UNVERIFIED"
+                )
+                self.assertNotIn("Current", str(response.get("result")))
+
+    def test_object_liveness_exception_is_unverified_without_scope_growth(self):
+        document_atom = object()
+        object_atom = object()
+        registered = FakeObject(
+            0, "Registered", 860751, "Cube", atom_key=object_atom
+        )
+        self.document = FakeDocument([registered], atom_key=document_atom)
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        issued_count = len(self.plugin._OBJECT_SCOPES._issued_scopes)
+        registered.liveness_error = True
+
+        lookup = self.execute_task("get_object", {"object_id": issued_id})
+        current = FakeObject(
+            0, "Current", 860751, "Cube", atom_key=object_atom
+        )
+        self.document = FakeDocument([current], atom_key=document_atom)
+        summary = self.dispatch("list_objects")["objects"][0]
+
+        self.assertEqual(lookup["error"]["code"], "OBJECT_ID_UNVERIFIED")
+        self.assertFalse(summary["addressable"])
+        self.assertEqual(summary["id_error"], "OBJECT_ID_UNVERIFIED")
+        self.assertEqual(
+            len(self.plugin._OBJECT_SCOPES._issued_scopes), issued_count
+        )
+
+    def test_uncertain_registry_comparison_does_not_mint_new_scope(self):
+        registered = FakeObject(0, "Registered", 860801, "Cube")
+        self.document = FakeDocument([registered])
+        self.dispatch("list_objects")
+        issued_count = len(self.plugin._OBJECT_SCOPES._issued_scopes)
+        registered.equality_error = True
+        newcomer = FakeObject(0, "Newcomer", 860802, "Cube")
+        self.document.roots = [newcomer]
+
+        summary = self.dispatch("list_objects")["objects"][0]
+
+        self.assertFalse(summary["addressable"])
+        self.assertEqual(summary["id_error"], "OBJECT_ID_UNVERIFIED")
+        self.assertEqual(
+            len(self.plugin._OBJECT_SCOPES._issued_scopes), issued_count
+        )
 
     def test_children_completeness_with_no_children(self):
         parent = FakeObject(1, "Parent", 870001, "Fake")
@@ -513,8 +731,8 @@ class Phase2A1HardeningTests(unittest.TestCase):
 
         result = self.dispatch("get_object", {"object_id": object_id(1)})
 
-        self.assertEqual(result["children"], [object_id(2), object_id(3)])
-        self.assertNotIn(object_id(4), result["children"])
+        self.assertEqual(result["children"], [object_id(2), object_id(4)])
+        self.assertNotIn(object_id(3), result["children"])
         self.assertEqual(result["child_count"], 2)
         self.assertEqual(result["addressable_child_count"], 2)
         self.assertEqual(result["unaddressable_child_count"], 0)
@@ -522,11 +740,18 @@ class Phase2A1HardeningTests(unittest.TestCase):
 
     def test_children_completeness_reports_unaddressable_only_child(self):
         child = FakeObject(None, "Child", 872002, "Fake")
-        parent = FakeObject(1, "Parent", 872001, "Fake", children=[child])
+        parent = FakeObject(1, "Parent", 872001, "Fake")
         self.document = FakeDocument([parent])
-        self.dispatch("list_objects")
+        parent_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        self.plugin._OBJECT_SCOPES._token_factory = lambda: "not-a-scope"
+        parent.children = [child]
+        parent._down = child
+        listed = self.dispatch("list_objects")["objects"]
+        self.assertEqual(listed[0]["object_id"], parent_id)
+        self.assertFalse(listed[1]["addressable"])
+        self.assertEqual(listed[1]["id_error"], "OBJECT_ID_UNAVAILABLE")
 
-        result = self.dispatch("get_object", {"object_id": object_id(1)})
+        result = self.dispatch("get_object", {"object_id": parent_id})
 
         self.assertEqual(result["children"], [])
         self.assertEqual(result["child_count"], 1)
@@ -534,10 +759,15 @@ class Phase2A1HardeningTests(unittest.TestCase):
         self.assertEqual(result["unaddressable_child_count"], 1)
         self.assertFalse(result["children_complete"])
 
-    def test_children_completeness_reports_mixed_and_duplicate_guid_children(self):
+    def test_children_completeness_reports_mixed_and_unverified_children(self):
         addressable = FakeObject(2, "Addressable", 873002, "Fake")
-        duplicate_a = FakeObject(3, "Duplicate A", 873003, "Fake")
-        duplicate_b = FakeObject(3, "Duplicate B", 873004, "Fake")
+        duplicate_atom = object()
+        duplicate_a = FakeObject(
+            3, "Duplicate A", 873003, "Fake", atom_key=duplicate_atom
+        )
+        duplicate_b = FakeObject(
+            3, "Duplicate B", 873004, "Fake", atom_key=duplicate_atom
+        )
         parent = FakeObject(
             1,
             "Parent",
@@ -546,11 +776,13 @@ class Phase2A1HardeningTests(unittest.TestCase):
             children=[addressable, duplicate_a, duplicate_b],
         )
         self.document = FakeDocument([parent])
-        self.dispatch("list_objects")
+        listed = self.dispatch("list_objects")["objects"]
+        parent_id = listed[0]["object_id"]
+        addressable_id = listed[1]["object_id"]
 
-        result = self.dispatch("get_object", {"object_id": object_id(1)})
+        result = self.dispatch("get_object", {"object_id": parent_id})
 
-        self.assertEqual(result["children"], [object_id(2)])
+        self.assertEqual(result["children"], [addressable_id])
         self.assertEqual(result["child_count"], 3)
         self.assertEqual(result["addressable_child_count"], 1)
         self.assertEqual(result["unaddressable_child_count"], 2)

@@ -47,7 +47,7 @@ from cinema4d_mcp.config import SERVER_VERSION
 
 
 TOKEN = "phase1-test-token-with-at-least-32-bytes"
-OBJECT_ID = "c4d:{}:123456789".format("a" * 32)
+OBJECT_ID = "c4d:{}:{}".format("a" * 32, "b" * 32)
 SERVER_PATH = Path(__file__).resolve().parents[1] / "src" / "cinema4d_mcp" / "server.py"
 
 
@@ -121,20 +121,24 @@ class ExternalServerTests(unittest.TestCase):
 
         connect.assert_not_called()
 
-    def test_external_object_id_validator_matches_uint64_canonical_contract(self):
+    def test_external_object_id_validator_matches_scope_canonical_contract(self):
         scope = "a" * 32
         for value in (
-            "c4d:{}:1".format(scope),
-            "c4d:{}:18446744073709551615".format(scope),
+            "c4d:{}:{}".format(scope, "0" * 31 + "1"),
+            "c4d:{}:{}".format(scope, "f" * 32),
         ):
             self.assertTrue(server._is_valid_object_id(value))
         for value in (
-            "c4d:{}:0".format(scope),
-            "c4d:{}:-1".format(scope),
-            "c4d:{}:+1".format(scope),
-            "c4d:{}:01".format(scope),
-            "c4d:{}:18446744073709551616".format(scope),
-            "c4d:1",
+            "c4d:",
+            "c4d:abc:def",
+            "c4d:{}".format(scope),
+            "c4d:{}:123".format(scope),
+            "c4d:{}:{}".format(scope.upper(), "b" * 32),
+            "c4d:{}:{}".format(scope, "B" * 32),
+            "c4d:{}:{}:extra".format(scope, "b" * 32),
+            " c4d:{}:{}".format(scope, "b" * 32),
+            "c4d:{}:{} ".format(scope, "b" * 32),
+            "c4d:{}:{}".format(scope, "g" * 32),
         ):
             self.assertFalse(server._is_valid_object_id(value))
 
