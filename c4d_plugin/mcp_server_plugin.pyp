@@ -1,4 +1,4 @@
-"""Secure Phase 2A Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2A.1 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
 five allowed commands are executed from a custom CoreMessage on Cinema 4D's
@@ -11,6 +11,7 @@ import json
 import math
 import os
 import queue
+import secrets
 import socket
 import threading
 import time
@@ -23,16 +24,22 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 2A Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2A.1 Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.2.0-phase1"
+BRIDGE_VERSION = "0.2.0-phase2a1"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
 DEFAULT_CLIENT_TIMEOUT = 5.0
 DEFAULT_MAIN_THREAD_TIMEOUT = 5.0
+MAX_RESPONSE_FRAME_BYTES = 64 * 1024
+DEFAULT_LIST_LIMIT = 100
+MAX_LIST_LIMIT = 200
+UINT64_MAX = (1 << 64) - 1
+DOCUMENT_SCOPE_BYTES = 16
+DOCUMENT_SCOPE_HEX_LENGTH = DOCUMENT_SCOPE_BYTES * 2
 ACTIVE_COMMAND_NAMES = (
     "ping",
     "get_capabilities",
@@ -42,7 +49,9 @@ ACTIVE_COMMAND_NAMES = (
 )
 ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
 OBJECT_ID_PREFIX = "c4d:"
-MAX_OBJECT_ID_LENGTH = 128
+MAX_OBJECT_ID_LENGTH = (
+    len(OBJECT_ID_PREFIX) + DOCUMENT_SCOPE_HEX_LENGTH + 1 + len(str(UINT64_MAX))
+)
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
 TOKEN_MIN_ESTIMATED_ENTROPY_BITS = 128
@@ -59,6 +68,15 @@ def _success_envelope(request_id, result):
         "result": result,
         "error": None,
     }
+
+
+def _serialize_response_frame(response):
+    """Serialize exactly as the socket transport emits a response frame."""
+    return json.dumps(
+        response,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8") + b"\n"
 
 
 def _enqueue_main_thread_message(msg_queue, message_type, value):
@@ -155,30 +173,112 @@ def _format_c4d_version(raw_version):
     return "{}.{}.{}".format(year, minor, patch)
 
 
-def _is_valid_object_id(value):
-    if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
-        return False
-    if not value.startswith(OBJECT_ID_PREFIX):
-        return False
-    payload = value[len(OBJECT_ID_PREFIX) :]
-    digits = payload[1:] if payload.startswith("-") else payload
+def _is_valid_document_scope(value):
     return (
-        bool(digits)
-        and digits.isascii()
-        and digits.isdigit()
-        and digits[0] != "0"
+        isinstance(value, str)
+        and len(value) == DOCUMENT_SCOPE_HEX_LENGTH
+        and value.isascii()
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
-def _object_id_or_none(obj):
-    """Serialize documented integer GetGUID() output as an opaque string."""
+def _parse_object_id(value):
+    if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
+        return None
+    parts = value.split(":")
+    if len(parts) != 3 or parts[0] != "c4d":
+        return None
+    document_scope, guid_text = parts[1], parts[2]
+    if not _is_valid_document_scope(document_scope):
+        return None
+    if (
+        not guid_text
+        or not guid_text.isascii()
+        or not guid_text.isdigit()
+        or guid_text[0] == "0"
+    ):
+        return None
+    guid = int(guid_text)
+    if not 1 <= guid <= UINT64_MAX:
+        return None
+    return document_scope, guid
+
+
+def _is_valid_object_id(value):
+    return _parse_object_id(value) is not None
+
+
+def _object_guid_or_none(obj):
+    """Read the documented UInt64 GUID without normalizing invalid values."""
     try:
         guid = obj.GetGUID()
     except Exception:
         return None
-    if isinstance(guid, bool) or not isinstance(guid, int) or guid == 0:
+    if (
+        isinstance(guid, bool)
+        or not isinstance(guid, int)
+        or not 1 <= guid <= UINT64_MAX
+    ):
         return None
-    return "{}{}".format(OBJECT_ID_PREFIX, guid)
+    return guid
+
+
+def _serialize_object_id(document_scope, guid):
+    if not _is_valid_document_scope(document_scope):
+        raise ValueError("invalid document scope")
+    if isinstance(guid, bool) or not isinstance(guid, int):
+        raise ValueError("invalid object GUID")
+    value = "{}{}:{}".format(OBJECT_ID_PREFIX, document_scope, guid)
+    if _parse_object_id(value) != (document_scope, guid):
+        raise ValueError("invalid object GUID")
+    return value
+
+
+def _object_id_or_none(obj, document_scope):
+    guid = _object_guid_or_none(obj)
+    if guid is None:
+        return None
+    return _serialize_object_id(document_scope, guid)
+
+
+class _DocumentScopeRegistry:
+    """Bind random scopes to exact retained document wrapper capabilities.
+
+    Cinema 4D 2023.2 exposes no documented stable BaseDocument identifier in
+    Python. A strong reference prevents Python identity reuse. If C4D returns a
+    different wrapper, the registry does not guess that it is the same document.
+    """
+
+    def __init__(self, token_factory=None):
+        self._token_factory = token_factory or (
+            lambda: secrets.token_hex(DOCUMENT_SCOPE_BYTES)
+        )
+        self._documents = {}
+
+    def scope_for(self, doc):
+        for document_scope, registered_doc in self._documents.items():
+            if registered_doc is doc:
+                return document_scope
+        for _ in range(16):
+            document_scope = self._token_factory()
+            if (
+                _is_valid_document_scope(document_scope)
+                and document_scope not in self._documents
+            ):
+                self._documents[document_scope] = doc
+                return document_scope
+        raise RuntimeError("Could not allocate a document scope")
+
+    def status(self, doc, document_scope):
+        registered_doc = self._documents.get(document_scope)
+        if registered_doc is None:
+            return "stale"
+        if registered_doc is not doc:
+            return "mismatch"
+        return "current"
+
+
+_DOCUMENT_SCOPES = _DocumentScopeRegistry()
 
 
 def _walk_document_hierarchy(doc):
@@ -206,11 +306,12 @@ def _walk_document_hierarchy(doc):
     return entries
 
 
-def _build_identity_snapshot(doc):
+def _build_identity_snapshot(doc, document_scope=None):
+    document_scope = document_scope or _DOCUMENT_SCOPES.scope_for(doc)
     entries = _walk_document_hierarchy(doc)
     counts = {}
     for entry in entries:
-        candidate = _object_id_or_none(entry["object"])
+        candidate = _object_id_or_none(entry["object"], document_scope)
         entry["candidate_id"] = candidate
         if candidate is not None:
             counts[candidate] = counts.get(candidate, 0) + 1
@@ -221,7 +322,7 @@ def _build_identity_snapshot(doc):
         identity_by_object[id(entry["object"])] = (
             candidate if candidate is not None and counts[candidate] == 1 else None
         )
-    return entries, identity_by_object
+    return entries, identity_by_object, document_scope
 
 
 def _safe_type_name(obj):
@@ -280,7 +381,7 @@ def _require_active_document():
 
 
 def _read_scene_info(doc):
-    entries, identity_by_object = _build_identity_snapshot(doc)
+    entries, identity_by_object, document_scope = _build_identity_snapshot(doc)
     name = doc.GetDocumentName()
     path = doc.GetDocumentPath()
     if not isinstance(name, str) or not isinstance(path, str):
@@ -289,7 +390,7 @@ def _read_scene_info(doc):
     active_candidates = set()
     active_objects = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
     for obj in active_objects or []:
-        candidate = _object_id_or_none(obj)
+        candidate = _object_id_or_none(obj, document_scope)
         if candidate is not None:
             active_candidates.add(candidate)
 
@@ -310,13 +411,86 @@ def _read_scene_info(doc):
     }
 
 
-def _read_object_list(doc):
-    entries, identity_by_object = _build_identity_snapshot(doc)
+def _validated_list_params(params):
+    if set(params.keys()) - {"offset", "limit"}:
+        raise ValueError("list_objects received unsupported parameters")
+    offset = params.get("offset", 0)
+    limit = params.get("limit", DEFAULT_LIST_LIMIT)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be an integer greater than or equal to zero")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+    if not 1 <= limit <= MAX_LIST_LIMIT:
+        raise ValueError(
+            "limit must be between 1 and {}".format(MAX_LIST_LIMIT)
+        )
+    return {"offset": offset, "limit": limit}
+
+
+def _validated_command_params(command, params):
+    if command == "get_object":
+        if set(params.keys()) != {"object_id"} or not _is_valid_object_id(
+            params.get("object_id")
+        ):
+            raise ValueError("get_object requires one canonical object_id")
+        return {"object_id": params["object_id"]}
+    if command == "list_objects":
+        return _validated_list_params(params)
+    if command in ALLOWED_COMMANDS:
+        if params:
+            raise ValueError("This command does not accept parameters")
+        return {}
+    return params
+
+
+def _list_page_result(objects, total_count, offset, limit):
+    returned_count = len(objects)
+    consumed = offset + returned_count
     return {
-        "objects": [
-            _object_summary(entry, identity_by_object) for entry in entries
-        ]
+        "objects": objects,
+        "total_count": total_count,
+        "offset": offset,
+        "limit": limit,
+        "returned_count": returned_count,
+        "next_offset": consumed if consumed < total_count else None,
     }
+
+
+def _read_object_list(doc, params, request_id):
+    pagination = _validated_list_params(params)
+    offset = pagination["offset"]
+    limit = pagination["limit"]
+    entries, identity_by_object, _ = _build_identity_snapshot(doc)
+    total_count = len(entries)
+    objects = []
+
+    for absolute_index in range(offset, min(total_count, offset + limit)):
+        summary = _object_summary(entries[absolute_index], identity_by_object)
+        tentative = objects + [summary]
+        result = _list_page_result(tentative, total_count, offset, limit)
+        frame = _serialize_response_frame(_success_envelope(request_id, result))
+        if len(frame) > MAX_RESPONSE_FRAME_BYTES:
+            if not objects:
+                raise _BridgeCommandError(
+                    "LIST_ITEM_TOO_LARGE",
+                    "One object summary cannot fit in a bridge response frame",
+                    {
+                        "item_offset": absolute_index,
+                        "max_frame_bytes": MAX_RESPONSE_FRAME_BYTES,
+                    },
+                )
+            break
+        objects.append(summary)
+
+    result = _list_page_result(objects, total_count, offset, limit)
+    frame = _serialize_response_frame(_success_envelope(request_id, result))
+    if len(frame) > MAX_RESPONSE_FRAME_BYTES:
+        raise _BridgeCommandError(
+            "RESPONSE_TOO_LARGE",
+            "The list response cannot fit in a bridge response frame",
+            {"max_frame_bytes": MAX_RESPONSE_FRAME_BYTES},
+        )
+    return result
 
 
 def _vector_values(vector):
@@ -339,7 +513,29 @@ def _rotation_degree_values(rotation):
 
 
 def _read_object(doc, object_id):
-    entries, identity_by_object = _build_identity_snapshot(doc)
+    parsed = _parse_object_id(object_id)
+    if parsed is None:
+        raise _BridgeCommandError(
+            "INVALID_PARAMS",
+            "get_object requires one canonical object_id",
+        )
+    document_scope, _ = parsed
+    scope_status = _DOCUMENT_SCOPES.status(doc, document_scope)
+    if scope_status == "stale":
+        raise _BridgeCommandError(
+            "STALE_OBJECT_ID",
+            "The object_id was not issued by this plugin process session",
+        )
+    if scope_status == "mismatch":
+        raise _BridgeCommandError(
+            "DOCUMENT_MISMATCH",
+            "The object_id belongs to a different document scope",
+        )
+
+    entries, identity_by_object, _ = _build_identity_snapshot(
+        doc,
+        document_scope,
+    )
     matches = [
         entry for entry in entries if entry["candidate_id"] == object_id
     ]
@@ -362,12 +558,16 @@ def _read_object(doc, object_id):
     )
     # Reuse the per-request traversal entries so child wrappers do not have to
     # retain Python object identity across separate Cinema 4D API calls.
-    children = [
-        identity_by_object[id(child_entry["object"])]
-        for child_entry in entries
-        if child_entry["parent"] is obj
-        and identity_by_object[id(child_entry["object"])] is not None
+    direct_children = [
+        child_entry for child_entry in entries if child_entry["parent"] is obj
     ]
+    children = []
+    for child_entry in direct_children:
+        child_id = identity_by_object[id(child_entry["object"])]
+        if child_id is not None:
+            children.append(child_id)
+    child_count = len(direct_children)
+    addressable_child_count = len(children)
 
     position = obj.GetRelPos()
     rotation = obj.GetRelRot()
@@ -385,19 +585,28 @@ def _read_object(doc, object_id):
             "space": "relative",
         },
         "children": children,
+        "child_count": child_count,
+        "addressable_child_count": addressable_child_count,
+        "unaddressable_child_count": child_count - addressable_child_count,
+        "children_complete": child_count == addressable_child_count,
     }
     if parent is not None and parent_id is None:
         result["parent_id_error"] = "OBJECT_ID_UNAVAILABLE"
     return result
 
 
-def _dispatch_read_command(command, params):
+def _dispatch_read_command(command, params, request_id=None):
+    try:
+        params = _validated_command_params(command, params)
+    except ValueError as exc:
+        raise _BridgeCommandError("INVALID_PARAMS", str(exc))
+
     try:
         doc = _require_active_document()
         if command == "get_scene_info":
             return _read_scene_info(doc)
         if command == "list_objects":
-            return _read_object_list(doc)
+            return _read_object_list(doc, params, request_id)
         if command == "get_object":
             object_id = params.get("object_id")
             if not _is_valid_object_id(object_id):
@@ -535,7 +744,9 @@ class _MainThreadTask:
 
         try:
             result = self.server._dispatch_on_main_thread(
-                self.command, self.params
+                self.command,
+                self.params,
+                self.request_id,
             )
             self.result = _success_envelope(self.request_id, result)
         except _BridgeCommandError as exc:
@@ -888,7 +1099,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 2A",
+                        "Command is not available in Phase 2A.1",
                         retryable=False,
                     ),
                 )
@@ -973,28 +1184,41 @@ class C4DSocketServer(threading.Thread):
             )
         if not isinstance(request.get("params"), dict):
             return ("INVALID_REQUEST", "params must be an object")
-        if request.get("command") == "get_object":
-            params = request["params"]
-            if set(params.keys()) != {"object_id"} or not _is_valid_object_id(
-                params.get("object_id")
-            ):
-                return (
-                    "INVALID_PARAMS",
-                    "get_object requires one canonical object_id",
+        if request["command"] in ALLOWED_COMMANDS:
+            try:
+                _validated_command_params(
+                    request["command"],
+                    request["params"],
                 )
-        elif request["params"]:
-            return (
-                "INVALID_REQUEST",
-                "This command does not accept parameters",
-            )
+            except ValueError as exc:
+                return ("INVALID_PARAMS", str(exc))
         return None
 
     def _send_response(self, client, response):
-        payload = json.dumps(
-            response,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8") + b"\n"
+        payload = _serialize_response_frame(response)
+        if len(payload) > MAX_RESPONSE_FRAME_BYTES:
+            request_id = (
+                response.get("request_id") if isinstance(response, dict) else None
+            )
+            if not isinstance(request_id, str) or len(request_id) > 128:
+                request_id = None
+            payload = _serialize_response_frame(
+                _error_envelope(
+                    request_id,
+                    "RESPONSE_TOO_LARGE",
+                    "Bridge response exceeds the transport frame limit",
+                    retryable=False,
+                    details={"max_frame_bytes": MAX_RESPONSE_FRAME_BYTES},
+                )
+            )
+            if len(payload) > MAX_RESPONSE_FRAME_BYTES:
+                payload = _serialize_response_frame(
+                    _error_envelope(
+                        None,
+                        "RESPONSE_TOO_LARGE",
+                        "Bridge response exceeds the transport frame limit",
+                    )
+                )
         client.sendall(payload)
 
     def execute_on_main_thread(self, command, params, request_id):
@@ -1034,7 +1258,7 @@ class C4DSocketServer(threading.Thread):
             with self._state_lock:
                 self._active_tasks.discard(task)
 
-    def _dispatch_on_main_thread(self, command, params):
+    def _dispatch_on_main_thread(self, command, params, request_id=None):
         """The only entry point allowed to call Cinema 4D APIs."""
         if hasattr(c4d, "threading") and not c4d.threading.GeIsMainThread():
             raise RuntimeError("dispatcher is not running on the main thread")
@@ -1089,8 +1313,8 @@ class C4DSocketServer(threading.Thread):
                 },
             }
         if command in ("get_scene_info", "list_objects", "get_object"):
-            return _dispatch_read_command(command, params)
-        raise ValueError("unsupported Phase 2A command")
+            return _dispatch_read_command(command, params, request_id)
+        raise ValueError("unsupported Phase 2A.1 command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -1109,7 +1333,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 2A Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2A.1 Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
@@ -1285,6 +1509,6 @@ if __name__ == "__main__":
         PLUGIN_NAME,
         0,
         None,
-        "Secure localhost-only MCP Phase 1 bridge",
+        "Secure localhost-only MCP Phase 2A.1 bridge",
         SocketServerPlugin(),
     )

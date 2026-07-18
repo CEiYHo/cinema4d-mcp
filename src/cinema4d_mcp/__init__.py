@@ -1,6 +1,6 @@
-"""Secure Phase 1 MCP connectivity for Cinema 4D."""
+"""Secure Phase 2A.1 MCP connectivity for Cinema 4D."""
 
-__version__ = "0.2.0-phase1"
+__version__ = "0.2.0-phase2a1"
 
 from .startup import run_mcp_runtime
 

@@ -1,4 +1,4 @@
-"""Phase 2A MCP server exposing a minimal read-only Cinema 4D surface."""
+"""Phase 2A.1 MCP server exposing a hardened read-only Cinema 4D surface."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import asyncio
 import json
 import socket
 import uuid
-from typing import Any, Dict, Optional
+from typing import Annotated, Any, Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .config import (
     C4D_HOST,
@@ -32,22 +33,53 @@ ACTIVE_TOOL_NAMES = (
     "get_object",
 )
 OBJECT_ID_PREFIX = "c4d:"
-MAX_OBJECT_ID_LENGTH = 128
+UINT64_MAX = (1 << 64) - 1
+DOCUMENT_SCOPE_HEX_LENGTH = 32
+MAX_OBJECT_ID_LENGTH = (
+    len(OBJECT_ID_PREFIX) + DOCUMENT_SCOPE_HEX_LENGTH + 1 + len(str(UINT64_MAX))
+)
+DEFAULT_LIST_LIMIT = 100
+MAX_LIST_LIMIT = 200
+MCP_OFFSET = Annotated[int, Field(strict=True, ge=0)]
+MCP_LIMIT = Annotated[int, Field(strict=True, ge=1, le=MAX_LIST_LIMIT)]
 
 
 def _is_valid_object_id(value: Any) -> bool:
     if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
         return False
-    if not value.startswith(OBJECT_ID_PREFIX):
+    parts = value.split(":")
+    if len(parts) != 3 or parts[0] != "c4d":
         return False
-    payload = value[len(OBJECT_ID_PREFIX) :]
-    digits = payload[1:] if payload.startswith("-") else payload
-    return (
-        bool(digits)
-        and digits.isascii()
-        and digits.isdigit()
-        and digits[0] != "0"
-    )
+    document_scope, guid_text = parts[1], parts[2]
+    if (
+        len(document_scope) != DOCUMENT_SCOPE_HEX_LENGTH
+        or not document_scope.isascii()
+        or any(character not in "0123456789abcdef" for character in document_scope)
+    ):
+        return False
+    if (
+        not guid_text
+        or not guid_text.isascii()
+        or not guid_text.isdigit()
+        or guid_text[0] == "0"
+    ):
+        return False
+    guid = int(guid_text)
+    return 1 <= guid <= UINT64_MAX
+
+
+def _validated_list_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    if set(params) - {"offset", "limit"}:
+        raise ValueError("list_objects received unsupported parameters")
+    offset = params.get("offset", 0)
+    limit = params.get("limit", DEFAULT_LIST_LIMIT)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be an integer greater than or equal to zero")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+    if not 1 <= limit <= MAX_LIST_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    return {"offset": offset, "limit": limit}
 
 
 def _validated_command_params(
@@ -64,9 +96,13 @@ def _validated_command_params(
         ):
             raise ValueError("get_object requires one canonical object_id")
         return {"object_id": params["object_id"]}
-    if params:
-        raise ValueError("This command does not accept parameters")
-    return {}
+    if command == "list_objects":
+        return _validated_list_params(params)
+    if command in ACTIVE_TOOL_NAMES:
+        if params:
+            raise ValueError("This command does not accept parameters")
+        return {}
+    return params
 
 
 def _error_envelope(
@@ -141,6 +177,23 @@ def _validate_response(response: Any, request_id: str) -> Optional[Dict[str, Any
     return None
 
 
+class Cinema4DFastMCP(FastMCP):
+    """Validate raw tool arguments before FastMCP/Pydantic can coerce them."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: Dict[str, Any],
+    ) -> Any:
+        if name in ACTIVE_TOOL_NAMES:
+            request_id = uuid.uuid4().hex
+            try:
+                _validated_command_params(name, arguments)
+            except ValueError as exc:
+                return _error_envelope(request_id, "INVALID_PARAMS", str(exc))
+        return await super().call_tool(name, arguments)
+
+
 def send_to_c4d(
     command: str,
     *,
@@ -153,7 +206,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "UNKNOWN_COMMAND",
-            "Command is not available in Phase 2A",
+            "Command is not available in Phase 2A.1",
         )
 
     request_id = request_id or uuid.uuid4().hex
@@ -209,7 +262,7 @@ def send_to_c4d(
                     "C4D_UNAVAILABLE",
                     "Cinema 4D closed the connection without a response",
                     retryable=True,
-                    user_action="Confirm the Phase 2A bridge is running in Cinema 4D",
+                    user_action="Confirm the Phase 2A.1 bridge is running in Cinema 4D",
                 )
             response_data += chunk
             if len(response_data) > MAX_FRAME_BYTES:
@@ -254,7 +307,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_TIMEOUT",
-            "Timed out waiting for the Cinema 4D Phase 2A bridge",
+            "Timed out waiting for the Cinema 4D Phase 2A.1 bridge",
             retryable=True,
             user_action="Confirm Cinema 4D is responsive and retry ping",
         )
@@ -267,9 +320,9 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_UNAVAILABLE",
-            "Could not connect to the Cinema 4D Phase 2A bridge",
+            "Could not connect to the Cinema 4D Phase 2A.1 bridge",
             retryable=True,
-            user_action="Start the authenticated Phase 2A bridge in Cinema 4D",
+            user_action="Start the authenticated Phase 2A.1 bridge in Cinema 4D",
         )
     except Exception as exc:
         logger.error(
@@ -290,7 +343,7 @@ def send_to_c4d(
                 pass
 
 
-mcp = FastMCP(name="Cinema4D")
+mcp = Cinema4DFastMCP(name="Cinema4D")
 
 
 @mcp.tool()
@@ -301,7 +354,7 @@ async def ping() -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_capabilities() -> Dict[str, Any]:
-    """Report verified Phase 2A runtime capabilities; has no scene side effects."""
+    """Report verified Phase 2A.1 capabilities; has no scene side effects."""
     return await asyncio.to_thread(send_to_c4d, "get_capabilities")
 
 
@@ -312,9 +365,16 @@ async def get_scene_info() -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def list_objects() -> Dict[str, Any]:
-    """List the active document hierarchy in depth-first pre-order; read-only."""
-    return await asyncio.to_thread(send_to_c4d, "list_objects")
+async def list_objects(
+    offset: MCP_OFFSET = 0,
+    limit: MCP_LIMIT = DEFAULT_LIST_LIMIT,
+) -> Dict[str, Any]:
+    """Read one bounded DFS hierarchy page; offset >= 0 and 1 <= limit <= 200."""
+    return await asyncio.to_thread(
+        send_to_c4d,
+        "list_objects",
+        params={"offset": offset, "limit": limit},
+    )
 
 
 @mcp.tool()
