@@ -1,4 +1,4 @@
-"""Phase 1 MCP server exposing only connectivity and capability tools."""
+"""Phase 2A MCP server exposing a minimal read-only Cinema 4D surface."""
 
 from __future__ import annotations
 
@@ -24,7 +24,49 @@ from .config import (
 from .utils import logger
 
 
-ACTIVE_TOOL_NAMES = ("ping", "get_capabilities")
+ACTIVE_TOOL_NAMES = (
+    "ping",
+    "get_capabilities",
+    "get_scene_info",
+    "list_objects",
+    "get_object",
+)
+OBJECT_ID_PREFIX = "c4d:"
+MAX_OBJECT_ID_LENGTH = 128
+
+
+def _is_valid_object_id(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
+        return False
+    if not value.startswith(OBJECT_ID_PREFIX):
+        return False
+    payload = value[len(OBJECT_ID_PREFIX) :]
+    digits = payload[1:] if payload.startswith("-") else payload
+    return (
+        bool(digits)
+        and digits.isascii()
+        and digits.isdigit()
+        and digits[0] != "0"
+    )
+
+
+def _validated_command_params(
+    command: str,
+    params: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    if command == "get_object":
+        if set(params) != {"object_id"} or not _is_valid_object_id(
+            params.get("object_id")
+        ):
+            raise ValueError("get_object requires one canonical object_id")
+        return {"object_id": params["object_id"]}
+    if params:
+        raise ValueError("This command does not accept parameters")
+    return {}
 
 
 def _error_envelope(
@@ -104,16 +146,25 @@ def send_to_c4d(
     *,
     token: Optional[str] = None,
     request_id: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Send one authenticated Phase 1 command to the local C4D bridge."""
+    """Send one authenticated command to the local read-only C4D bridge."""
     if command not in ACTIVE_TOOL_NAMES:
         return _error_envelope(
             request_id,
             "UNKNOWN_COMMAND",
-            "Command is not available in Phase 1",
+            "Command is not available in Phase 2A",
         )
 
     request_id = request_id or uuid.uuid4().hex
+    try:
+        validated_params = _validated_command_params(command, params)
+    except ValueError as exc:
+        return _error_envelope(
+            request_id,
+            "INVALID_PARAMS",
+            str(exc),
+        )
     try:
         configured_token = (
             validate_c4d_token(token) if token is not None else get_c4d_token()
@@ -132,7 +183,7 @@ def send_to_c4d(
         "request_id": request_id,
         "command": command,
         "token": configured_token,
-        "params": {},
+        "params": validated_params,
     }
     payload = json.dumps(
         request,
@@ -158,14 +209,14 @@ def send_to_c4d(
                     "C4D_UNAVAILABLE",
                     "Cinema 4D closed the connection without a response",
                     retryable=True,
-                    user_action="Confirm the Phase 1 bridge is running in Cinema 4D",
+                    user_action="Confirm the Phase 2A bridge is running in Cinema 4D",
                 )
             response_data += chunk
             if len(response_data) > MAX_FRAME_BYTES:
                 return _error_envelope(
                     request_id,
                     "FRAME_TOO_LARGE",
-                    "Cinema 4D response exceeds the Phase 1 size limit",
+                    "Cinema 4D response exceeds the bridge size limit",
                 )
 
         frame, trailing = response_data.split(b"\n", 1)
@@ -203,7 +254,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_TIMEOUT",
-            "Timed out waiting for the Cinema 4D Phase 1 bridge",
+            "Timed out waiting for the Cinema 4D Phase 2A bridge",
             retryable=True,
             user_action="Confirm Cinema 4D is responsive and retry ping",
         )
@@ -216,9 +267,9 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_UNAVAILABLE",
-            "Could not connect to the Cinema 4D Phase 1 bridge",
+            "Could not connect to the Cinema 4D Phase 2A bridge",
             retryable=True,
-            user_action="Start the authenticated Phase 1 bridge in Cinema 4D",
+            user_action="Start the authenticated Phase 2A bridge in Cinema 4D",
         )
     except Exception as exc:
         logger.error(
@@ -250,8 +301,30 @@ async def ping() -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_capabilities() -> Dict[str, Any]:
-    """Report verified Phase 1 runtime capabilities; has no scene side effects."""
+    """Report verified Phase 2A runtime capabilities; has no scene side effects."""
     return await asyncio.to_thread(send_to_c4d, "get_capabilities")
+
+
+@mcp.tool()
+async def get_scene_info() -> Dict[str, Any]:
+    """Read active-document metadata, object count, and selected object IDs."""
+    return await asyncio.to_thread(send_to_c4d, "get_scene_info")
+
+
+@mcp.tool()
+async def list_objects() -> Dict[str, Any]:
+    """List the active document hierarchy in depth-first pre-order; read-only."""
+    return await asyncio.to_thread(send_to_c4d, "list_objects")
+
+
+@mcp.tool()
+async def get_object(object_id: str) -> Dict[str, Any]:
+    """Read one object by opaque ID; rotation_deg is relative H/P/B order."""
+    return await asyncio.to_thread(
+        send_to_c4d,
+        "get_object",
+        params={"object_id": object_id},
+    )
 
 
 mcp_app = mcp

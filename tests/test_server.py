@@ -1,4 +1,4 @@
-"""Tests for the external Phase 1 MCP server boundary."""
+"""Tests for the external Phase 2A MCP server boundary."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def success_response(request_id="req-1"):
 
 
 class ExternalServerTests(unittest.TestCase):
-    def test_active_mcp_surface_has_exactly_two_tools(self):
+    def test_active_mcp_surface_has_exactly_five_tools(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         decorated_tools = []
@@ -75,8 +75,15 @@ class ExternalServerTests(unittest.TestCase):
                 ):
                     decorated_tools.append(node.name)
 
-        self.assertEqual(tuple(decorated_tools), ("ping", "get_capabilities"))
-        self.assertEqual(server.ACTIVE_TOOL_NAMES, ("ping", "get_capabilities"))
+        expected = (
+            "ping",
+            "get_capabilities",
+            "get_scene_info",
+            "list_objects",
+            "get_object",
+        )
+        self.assertEqual(tuple(decorated_tools), expected)
+        self.assertEqual(server.ACTIVE_TOOL_NAMES, expected)
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_authenticated_request_uses_versioned_envelope(self, create_connection):
@@ -100,6 +107,44 @@ class ExternalServerTests(unittest.TestCase):
         self.assertEqual(sent["params"], {})
         create_connection.assert_called_once_with(("127.0.0.1", 5555), timeout=2.0)
         bridge_socket.close.assert_called_once()
+
+    @patch("cinema4d_mcp.server.socket.create_connection")
+    def test_get_object_sends_only_validated_object_id(self, create_connection):
+        bridge_socket = MagicMock()
+        bridge_socket.recv.return_value = (
+            json.dumps(success_response()).encode("utf-8") + b"\n"
+        )
+        create_connection.return_value = bridge_socket
+
+        response = server.send_to_c4d(
+            "get_object",
+            token=TOKEN,
+            request_id="req-1",
+            params={"object_id": "c4d:123456789"},
+        )
+
+        self.assertTrue(response["ok"])
+        sent = json.loads(bridge_socket.sendall.call_args.args[0].decode("utf-8"))
+        self.assertEqual(sent["params"], {"object_id": "c4d:123456789"})
+
+    @patch("cinema4d_mcp.server.socket.create_connection")
+    def test_invalid_object_params_fail_before_connect(self, create_connection):
+        for params in (
+            {},
+            {"object_id": "Cube"},
+            {"object_id": "c4d:0"},
+            {"object_id": "c4d:123", "name": "Cube"},
+        ):
+            with self.subTest(params=params):
+                response = server.send_to_c4d(
+                    "get_object",
+                    token=TOKEN,
+                    request_id="req-1",
+                    params=params,
+                )
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "INVALID_PARAMS")
+        create_connection.assert_not_called()
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_connection_refused_is_structured(self, create_connection):
