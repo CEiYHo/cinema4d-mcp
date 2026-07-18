@@ -101,12 +101,43 @@ def link_hierarchy(roots):
 
 
 class FakeDocument:
-    def __init__(self, roots=None, *, name="Untitled 1", path="", active=None):
+    def __init__(
+        self,
+        roots=None,
+        *,
+        name="Untitled 1",
+        path="",
+        active=None,
+        atom_key=None,
+        alive=True,
+        equality_error=False,
+        liveness_error=False,
+    ):
         self.roots = link_hierarchy(roots or [])
         self.name = name
         self.path = path
         self.active = list(active or [])
         self.read_calls = 0
+        self.atom_key = atom_key if atom_key is not None else object()
+        self.alive = alive
+        self.equality_error = equality_error
+        self.liveness_error = liveness_error
+
+    def __eq__(self, other):
+        if self.equality_error:
+            raise RuntimeError("C4DAtom equality failed")
+        return (
+            isinstance(other, FakeDocument)
+            and self.atom_key == other.atom_key
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def IsAlive(self):
+        if self.liveness_error:
+            raise RuntimeError("C4DAtom liveness failed")
+        return self.alive
 
     def GetFirstObject(self):
         self.read_calls += 1

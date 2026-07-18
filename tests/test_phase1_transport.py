@@ -293,7 +293,7 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
         self.assertEqual(result["cinema4d"]["version_raw"], 2023202)
         self.assertEqual(result["cinema4d"]["compatibility"], "target")
-        self.assertEqual(result["bridge_version"], "0.2.0-phase2a1")
+        self.assertEqual(result["bridge_version"], "0.2.0-phase2a2")
         self.assertEqual(
             result["tools"],
             [

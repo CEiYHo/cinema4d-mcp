@@ -1,4 +1,4 @@
-"""Hardening contracts for Phase 2A.1 pagination and scoped identities."""
+"""Hardening contracts for Phase 2A pagination and scoped identities."""
 
 from __future__ import annotations
 
@@ -298,14 +298,73 @@ class Phase2A1HardeningTests(unittest.TestCase):
         self.assertIsNone(response["request_id"])
         self.assertEqual(response["error"]["code"], "RESPONSE_TOO_LARGE")
 
+    def test_same_wrapper_reuses_document_scope(self):
+        self.document = FakeDocument()
+
+        first_scope = self.plugin._DOCUMENT_SCOPES.scope_for(self.document)
+        second_scope = self.plugin._DOCUMENT_SCOPES.scope_for(self.document)
+
+        self.assertEqual(first_scope, SCOPE_A)
+        self.assertEqual(second_scope, first_scope)
+
+    def test_equivalent_c4d_atom_wrappers_reuse_document_scope(self):
+        atom_key = object()
+        first_wrapper = FakeDocument(atom_key=atom_key)
+        second_wrapper = FakeDocument(atom_key=atom_key)
+
+        first_scope = self.plugin._DOCUMENT_SCOPES.scope_for(first_wrapper)
+        second_scope = self.plugin._DOCUMENT_SCOPES.scope_for(second_wrapper)
+
+        self.assertIsNot(first_wrapper, second_wrapper)
+        self.assertTrue(first_wrapper == second_wrapper)
+        self.assertEqual(second_scope, first_scope)
+
+    def test_equivalent_wrapper_can_immediately_get_issued_object_id(self):
+        atom_key = object()
+        shared_object = FakeObject(77, "Document A", 830001, "Fake A")
+        first_wrapper = FakeDocument([shared_object], atom_key=atom_key)
+        second_wrapper = FakeDocument([shared_object], atom_key=atom_key)
+        self.document = first_wrapper
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+
+        self.document = second_wrapper
+        response = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["name"], "Document A")
+
+    def test_repeated_a_to_a_wrapper_sequence_keeps_object_id_valid(self):
+        atom_key = object()
+        shared_object = FakeObject(77, "Document A", 830011, "Fake A")
+        wrappers = [
+            FakeDocument([shared_object], atom_key=atom_key)
+            for _ in range(5)
+        ]
+        self.document = wrappers[0]
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+
+        self.document = wrappers[1]
+        first_get = self.execute_task("get_object", {"object_id": issued_id})
+        self.document = wrappers[2]
+        second_get = self.execute_task("get_object", {"object_id": issued_id})
+        self.document = wrappers[3]
+        repeated_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        self.document = wrappers[4]
+        third_get = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertTrue(first_get["ok"])
+        self.assertTrue(second_get["ok"])
+        self.assertEqual(repeated_id, issued_id)
+        self.assertTrue(third_get["ok"])
+
     def test_cross_document_same_raw_guid_fails_closed_and_switch_back_recovers(self):
-        document_a = FakeDocument(
-            [FakeObject(77, "Document A", 830001, "Fake A")]
-        )
-        document_b = FakeDocument(
-            [FakeObject(77, "Document B", 830002, "Fake B")]
-        )
-        self.document = document_a
+        atom_a = object()
+        object_a = FakeObject(77, "Document A", 830001, "Fake A")
+        object_b = FakeObject(77, "Document B", 830002, "Fake B")
+        document_a_first = FakeDocument([object_a], atom_key=atom_a)
+        document_b = FakeDocument([object_b], atom_key=object())
+        document_a_second = FakeDocument([object_a], atom_key=atom_a)
+        self.document = document_a_first
         issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
 
         self.document = document_b
@@ -314,7 +373,7 @@ class Phase2A1HardeningTests(unittest.TestCase):
         self.assertEqual(mismatch["error"]["code"], "DOCUMENT_MISMATCH")
         self.assertNotIn("Document B", str(mismatch))
 
-        self.document = document_a
+        self.document = document_a_second
         recovered = self.execute_task("get_object", {"object_id": issued_id})
         self.assertTrue(recovered["ok"])
         self.assertEqual(recovered["result"]["name"], "Document A")
@@ -329,7 +388,7 @@ class Phase2A1HardeningTests(unittest.TestCase):
 
         self.assertEqual(response["error"]["code"], "STALE_OBJECT_ID")
 
-    def test_different_wrapper_is_not_guessed_to_be_same_document(self):
+    def test_different_live_document_wrappers_do_not_match(self):
         first_wrapper = FakeDocument([FakeObject(77, "First", 850001, "Fake")])
         self.document = first_wrapper
         issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
@@ -338,6 +397,59 @@ class Phase2A1HardeningTests(unittest.TestCase):
         response = self.execute_task("get_object", {"object_id": issued_id})
 
         self.assertEqual(response["error"]["code"], "DOCUMENT_MISMATCH")
+
+    def test_dead_registered_document_scope_becomes_stale(self):
+        document_a = FakeDocument([FakeObject(77, "Closed", 851001, "Fake")])
+        self.document = document_a
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        document_a.alive = False
+        self.document = FakeDocument([FakeObject(77, "Other", 851002, "Fake")])
+
+        response = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertEqual(response["error"]["code"], "STALE_OBJECT_ID")
+        self.assertNotIn(SCOPE_A, self.plugin._DOCUMENT_SCOPES._documents)
+
+    def test_liveness_exception_prunes_scope_fail_closed(self):
+        document_a = FakeDocument([FakeObject(77, "Closed", 851011, "Fake")])
+        self.document = document_a
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+        document_a.liveness_error = True
+        self.document = FakeDocument([FakeObject(77, "Other", 851012, "Fake")])
+
+        response = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertEqual(response["error"]["code"], "STALE_OBJECT_ID")
+        self.assertNotIn(SCOPE_A, self.plugin._DOCUMENT_SCOPES._documents)
+
+    def test_equality_exception_never_matches_document_scope(self):
+        first_wrapper = FakeDocument(equality_error=True)
+        second_wrapper = FakeDocument(atom_key=first_wrapper.atom_key)
+
+        first_scope = self.plugin._DOCUMENT_SCOPES.scope_for(first_wrapper)
+        second_scope = self.plugin._DOCUMENT_SCOPES.scope_for(second_wrapper)
+
+        self.assertNotEqual(second_scope, first_scope)
+
+    def test_equality_exception_fails_lookup_closed(self):
+        atom_key = object()
+        shared_object = FakeObject(77, "Document A", 852001, "Fake")
+        first_wrapper = FakeDocument(
+            [shared_object],
+            atom_key=atom_key,
+            equality_error=True,
+        )
+        second_wrapper = FakeDocument([shared_object], atom_key=atom_key)
+        self.document = first_wrapper
+        issued_id = self.dispatch("list_objects")["objects"][0]["object_id"]
+
+        self.document = second_wrapper
+        response = self.execute_task("get_object", {"object_id": issued_id})
+
+        self.assertEqual(
+            response["error"]["code"],
+            "DOCUMENT_ID_UNVERIFIED",
+        )
 
     def test_document_scoped_uint64_object_id_is_strictly_canonical(self):
         valid = (
