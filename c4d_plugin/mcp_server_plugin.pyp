@@ -8,6 +8,7 @@ is present in this Phase 1 runtime.
 
 import hmac
 import json
+import math
 import os
 import queue
 import socket
@@ -32,6 +33,12 @@ DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
 DEFAULT_CLIENT_TIMEOUT = 5.0
 DEFAULT_MAIN_THREAD_TIMEOUT = 5.0
 ALLOWED_COMMANDS = frozenset(("ping", "get_capabilities"))
+TOKEN_MIN_LENGTH = 32
+TOKEN_MAX_LENGTH = 256
+TOKEN_MIN_ESTIMATED_ENTROPY_BITS = 128
+TOKEN_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 
 
 def _success_envelope(request_id, result):
@@ -76,6 +83,38 @@ def _configured_port():
     if not 1 <= port <= 65535:
         raise ValueError("C4D_MCP_PORT must be between 1 and 65535")
     return port
+
+
+def _validated_configured_token(token):
+    """Validate a configured secret without ever returning it in an error."""
+    if not isinstance(token, str) or not token:
+        raise ValueError("C4D_MCP_TOKEN is required")
+    try:
+        encoded = token.encode("ascii", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError("C4D_MCP_TOKEN must use URL-safe ASCII characters")
+    if not TOKEN_MIN_LENGTH <= len(encoded) <= TOKEN_MAX_LENGTH:
+        raise ValueError(
+            "C4D_MCP_TOKEN must be between {} and {} ASCII characters".format(
+                TOKEN_MIN_LENGTH, TOKEN_MAX_LENGTH
+            )
+        )
+    if any(character not in TOKEN_ALPHABET for character in token):
+        raise ValueError("C4D_MCP_TOKEN must use URL-safe ASCII characters")
+    counts = {}
+    for character in token:
+        counts[character] = counts.get(character, 0) + 1
+    estimated_entropy_bits = 0.0
+    for count in counts.values():
+        probability = float(count) / len(token)
+        estimated_entropy_bits -= count * math.log(probability, 2)
+    if estimated_entropy_bits < TOKEN_MIN_ESTIMATED_ENTROPY_BITS:
+        raise ValueError(
+            "C4D_MCP_TOKEN must have at least {} bits of estimated entropy".format(
+                TOKEN_MIN_ESTIMATED_ENTROPY_BITS
+            )
+        )
+    return encoded
 
 
 def _format_c4d_version(raw_version):
@@ -170,18 +209,46 @@ class _MainThreadTask:
             self.state = "cancelled"
             return True
 
+    def cancel_for_shutdown(self):
+        """Cancel queued work and release its waiting socket thread."""
+        with self.lock:
+            if self.state != "queued":
+                return False
+            self.state = "cancelled"
+            self.result = _error_envelope(
+                self.request_id,
+                "SERVER_STOPPING",
+                "Cinema 4D bridge is stopping",
+                retryable=True,
+            )
+            self.event.set()
+            return True
+
     def current_state(self):
         with self.lock:
             return self.state
 
     def execute(self):
         """Run on the main thread; a timed-out queued task is never executed."""
-        with self.lock:
-            if self.state == "cancelled":
-                return False
-            if self.state != "queued":
-                return False
-            self.state = "running"
+        # The server lock makes the queued -> running transition atomic with
+        # stop(). Once stopping owns this lock, no queued task can begin.
+        with self.server._state_lock:
+            with self.lock:
+                if self.state == "cancelled":
+                    return False
+                if self.state != "queued":
+                    return False
+                if self.server.is_stopping():
+                    self.state = "cancelled"
+                    self.result = _error_envelope(
+                        self.request_id,
+                        "SERVER_STOPPING",
+                        "Cinema 4D bridge is stopping",
+                        retryable=True,
+                    )
+                    self.event.set()
+                    return False
+                self.state = "running"
 
         try:
             result = self.server._dispatch_on_main_thread(
@@ -223,16 +290,22 @@ class C4DSocketServer(threading.Thread):
         self.host = LOOPBACK_HOST
         self.port = int(port)
         self.token = token if token is not None else os.environ.get("C4D_MCP_TOKEN")
+        self._token_bytes = _validated_configured_token(self.token)
         self.request_size_limit = int(request_size_limit)
         self.client_timeout = float(client_timeout)
         self.main_thread_timeout = float(main_thread_timeout)
         self.msg_queue = msg_queue
         self.socket = None
+        self.active_client = None
         self.running = False
         self.daemon = True
+        self.startup_error = None
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._stopped_event = threading.Event()
+        self._active_tasks = set()
 
-        if not self.token:
-            raise ValueError("C4D_MCP_TOKEN is required")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         if self.request_size_limit < 128:
@@ -247,26 +320,78 @@ class C4DSocketServer(threading.Thread):
     def update_status(self, status):
         self.msg_queue.put(("STATUS", status))
 
+    def is_stopping(self):
+        return self._stop_event.is_set()
+
+    def wait_until_ready(self, timeout=2.0):
+        """Wait for bind success or a controlled startup failure."""
+        if not self._ready_event.wait(timeout):
+            return False
+        return self.running and self.startup_error is None
+
+    def wait_until_stopped(self, timeout=2.0):
+        return self._stopped_event.wait(timeout)
+
+    def _register_active_client(self, client):
+        with self._state_lock:
+            if self._stop_event.is_set():
+                return False
+            self.active_client = client
+            return True
+
+    def _clear_active_client(self, client):
+        with self._state_lock:
+            if self.active_client is client:
+                self.active_client = None
+
+    def _close_socket(self, target):
+        if target is None:
+            return
+        try:
+            target.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            target.close()
+        except OSError:
+            pass
+
     def run(self):
         """Accept one request at a time so C4D work cannot race."""
+        listener = None
         try:
+            if self._stop_event.is_set():
+                return
+
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket = listener
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                # On Windows SO_REUSEADDR can let a second listener bind the
+                # same address. Exclusive ownership makes collision handling
+                # deterministic while still releasing the port on close.
+                listener.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((LOOPBACK_HOST, self.port))
             listener.listen(4)
             listener.settimeout(0.5)
-            self.running = True
+            with self._state_lock:
+                if self._stop_event.is_set():
+                    return
+                self.socket = listener
+                self.running = True
             self.update_status("Online")
             self.log("Bridge listening on {}:{}".format(LOOPBACK_HOST, self.port))
+            self._ready_event.set()
 
-            while self.running:
+            while not self._stop_event.is_set():
                 try:
                     client, address = listener.accept()
                 except socket.timeout:
                     continue
                 except OSError:
-                    if self.running:
+                    if not self._stop_event.is_set():
                         raise
                     break
 
@@ -275,37 +400,81 @@ class C4DSocketServer(threading.Thread):
                 if not address or address[0] != LOOPBACK_HOST:
                     client.close()
                     continue
-                self.handle_client(client)
-        except Exception as exc:
-            self.log("Bridge stopped: {}".format(type(exc).__name__))
-        finally:
-            self.running = False
-            self.update_status("Offline")
-            if self.socket is not None:
+                if not self._register_active_client(client):
+                    self._close_socket(client)
+                    break
                 try:
-                    self.socket.close()
-                except OSError:
-                    pass
+                    self.handle_client(client)
+                finally:
+                    self._clear_active_client(client)
+        except OSError as exc:
+            code = "PORT_IN_USE" if getattr(exc, "errno", None) in (98, 48, 10048) else "STARTUP_FAILED"
+            self.startup_error = _error_envelope(
+                None,
+                code,
+                (
+                    "C4D_MCP_PORT is already in use"
+                    if code == "PORT_IN_USE"
+                    else "Cinema 4D bridge could not start"
+                ),
+                retryable=False,
+            )
+            self.log("Bridge startup failed: {}".format(code))
+        except Exception as exc:
+            self.startup_error = _error_envelope(
+                None,
+                "STARTUP_FAILED",
+                "Cinema 4D bridge could not start",
+                retryable=False,
+            )
+            self.log("Bridge startup failed: {}".format(type(exc).__name__))
+        finally:
+            self._ready_event.set()
+            with self._state_lock:
+                self._stop_event.set()
+                self.running = False
                 self.socket = None
+                active_client = self.active_client
+                self.active_client = None
+                active_tasks = list(self._active_tasks)
+            for task in active_tasks:
+                task.cancel_for_shutdown()
+            self._close_socket(active_client)
+            self._close_socket(listener)
+            self.update_status("Offline")
+            self._stopped_event.set()
 
-    def stop(self):
-        self.running = False
-        listener = self.socket
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
+    def stop(self, wait=True, timeout=2.0):
+        """Stop listener/client/tasks and optionally wait for thread termination."""
+        with self._state_lock:
+            self._stop_event.set()
+            self.running = False
+            listener = self.socket
+            active_client = self.active_client
+            active_tasks = list(self._active_tasks)
+
+        for task in active_tasks:
+            task.cancel_for_shutdown()
+        self._close_socket(active_client)
+        self._close_socket(listener)
         self.update_status("Offline")
+
+        if wait and self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout)
+        return not self.is_alive()
 
     def handle_client(self, client):
         """Read and process exactly one bounded newline-delimited request."""
         request_id = None
         try:
+            if self._stop_event.is_set():
+                return
             client.settimeout(self.client_timeout)
             buffer = b""
 
             while b"\n" not in buffer:
+                if self._stop_event.is_set():
+                    return
                 try:
                     chunk = client.recv(4096)
                 except socket.timeout:
@@ -380,12 +549,13 @@ class C4DSocketServer(threading.Thread):
             validation_error = self._validate_request(request)
             if validation_error is not None:
                 request_id = request.get("request_id") if isinstance(request, dict) else None
+                error_code, error_message = validation_error
                 self._send_response(
                     client,
                     _error_envelope(
                         request_id,
-                        "INVALID_REQUEST",
-                        validation_error,
+                        error_code,
+                        error_message,
                         retryable=False,
                     ),
                 )
@@ -393,7 +563,20 @@ class C4DSocketServer(threading.Thread):
 
             request_id = request["request_id"]
             supplied_token = request["token"]
-            if not hmac.compare_digest(str(supplied_token), str(self.token)):
+            try:
+                supplied_token_bytes = supplied_token.encode("ascii", errors="strict")
+            except UnicodeEncodeError:
+                self._send_response(
+                    client,
+                    _error_envelope(
+                        request_id,
+                        "INVALID_REQUEST",
+                        "token must use URL-safe ASCII characters",
+                        retryable=False,
+                    ),
+                )
+                return
+            if not hmac.compare_digest(supplied_token_bytes, self._token_bytes):
                 self._send_response(
                     client,
                     _error_envelope(
@@ -405,6 +588,8 @@ class C4DSocketServer(threading.Thread):
                 )
                 return
 
+            if self._stop_event.is_set():
+                return
             command = request["command"]
             if command not in ALLOWED_COMMANDS:
                 self._send_response(
@@ -418,6 +603,8 @@ class C4DSocketServer(threading.Thread):
                 )
                 return
 
+            if self._stop_event.is_set():
+                return
             response = self.execute_on_main_thread(
                 command,
                 request["params"],
@@ -448,7 +635,15 @@ class C4DSocketServer(threading.Thread):
 
     def _validate_request(self, request):
         if not isinstance(request, dict):
-            return "Request must be a JSON object"
+            return ("INVALID_REQUEST", "Request must be a JSON object")
+
+        if (
+            "protocol_version" in request
+            and request.get("protocol_version") != PROTOCOL_VERSION
+        ):
+            return ("PROTOCOL_MISMATCH", "Unsupported protocol_version")
+        if "token" not in request or request.get("token") == "":
+            return ("AUTH_REQUIRED", "A non-empty token is required")
 
         expected_keys = {
             "protocol_version",
@@ -458,21 +653,40 @@ class C4DSocketServer(threading.Thread):
             "params",
         }
         if set(request.keys()) != expected_keys:
-            return "Request fields do not match the Phase 1 protocol"
-        if request.get("protocol_version") != PROTOCOL_VERSION:
-            return "Unsupported protocol_version"
+            return (
+                "INVALID_REQUEST",
+                "Request fields do not match the Phase 1 protocol",
+            )
 
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
-            return "request_id must be a non-empty string of at most 128 characters"
+            return (
+                "INVALID_REQUEST",
+                "request_id must be a non-empty string of at most 128 characters",
+            )
         if not isinstance(request.get("command"), str):
-            return "command must be a string"
-        if not isinstance(request.get("token"), str) or not request.get("token"):
-            return "token must be a non-empty string"
+            return ("INVALID_REQUEST", "command must be a string")
+        if not isinstance(request.get("token"), str):
+            return ("INVALID_REQUEST", "token must be a string")
+        try:
+            request["token"].encode("ascii", errors="strict")
+        except UnicodeEncodeError:
+            return (
+                "INVALID_REQUEST",
+                "token must use URL-safe ASCII characters",
+            )
+        if any(character not in TOKEN_ALPHABET for character in request["token"]):
+            return (
+                "INVALID_REQUEST",
+                "token must use URL-safe ASCII characters",
+            )
         if not isinstance(request.get("params"), dict):
-            return "params must be an object"
+            return ("INVALID_REQUEST", "params must be an object")
         if request["params"]:
-            return "Phase 1 commands do not accept parameters"
+            return (
+                "INVALID_REQUEST",
+                "Phase 1 commands do not accept parameters",
+            )
         return None
 
     def _send_response(self, client, response):
@@ -484,24 +698,41 @@ class C4DSocketServer(threading.Thread):
         client.sendall(payload)
 
     def execute_on_main_thread(self, command, params, request_id):
-        task = _MainThreadTask(self, command, params, request_id)
-        self.msg_queue.put(("EXEC", task.execute))
-
-        if not task.event.wait(self.main_thread_timeout):
-            if task.cancel_if_queued():
-                return _error_envelope(
-                    request_id,
-                    "MAIN_THREAD_TIMEOUT",
-                    "Cinema 4D main thread did not start the request in time",
-                    retryable=False,
-                )
+        if self._stop_event.is_set():
             return _error_envelope(
                 request_id,
-                "OUTCOME_UNKNOWN",
-                "Cinema 4D began the request but did not finish before the timeout",
-                retryable=False,
+                "SERVER_STOPPING",
+                "Cinema 4D bridge is stopping",
+                retryable=True,
             )
-        return task.result
+
+        task = _MainThreadTask(self, command, params, request_id)
+        with self._state_lock:
+            if self._stop_event.is_set():
+                task.cancel_for_shutdown()
+                return task.result
+            self._active_tasks.add(task)
+        self.msg_queue.put(("EXEC", task.execute))
+
+        try:
+            if not task.event.wait(self.main_thread_timeout):
+                if task.cancel_if_queued():
+                    return _error_envelope(
+                        request_id,
+                        "MAIN_THREAD_TIMEOUT",
+                        "Cinema 4D main thread did not start the request in time",
+                        retryable=False,
+                    )
+                return _error_envelope(
+                    request_id,
+                    "OUTCOME_UNKNOWN",
+                    "Cinema 4D began the request but did not finish before the timeout",
+                    retryable=False,
+                )
+            return task.result
+        finally:
+            with self._state_lock:
+                self._active_tasks.discard(task)
 
     def _dispatch_on_main_thread(self, command, params):
         """The only Phase 1 entry point allowed to call Cinema 4D APIs."""
@@ -688,11 +919,29 @@ class SocketServerDialog(gui.GeDialog):
 
         self.SetString(self.AUTH_TEXT_ID, "Token configured: Yes")
         self.server.start()
+        if not self.server.wait_until_ready(timeout=2.0):
+            startup_error = self.server.startup_error
+            if startup_error is not None:
+                error = startup_error["error"]
+                self.AppendLog(
+                    "Bridge start failed: {} - {}".format(
+                        error["code"], error["message"]
+                    )
+                )
+            else:
+                self.AppendLog("Bridge start timed out")
+            self.server.stop(wait=True, timeout=2.0)
+            self.server = None
+            self.UpdateStatusText("Offline")
 
     def StopServer(self):
         if self.server is not None:
-            self.server.stop()
-            self.server = None
+            server = self.server
+            terminated = server.stop(wait=True, timeout=2.0)
+            if terminated:
+                self.server = None
+            else:
+                self.AppendLog("Bridge thread did not terminate within 2 seconds")
         self.UpdateStatusText("Offline")
 
 

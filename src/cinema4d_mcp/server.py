@@ -19,6 +19,7 @@ from .config import (
     SERVER_VERSION,
     get_c4d_port,
     get_c4d_token,
+    validate_c4d_token,
 )
 from .utils import logger
 
@@ -114,7 +115,9 @@ def send_to_c4d(
 
     request_id = request_id or uuid.uuid4().hex
     try:
-        configured_token = token if token is not None else get_c4d_token()
+        configured_token = (
+            validate_c4d_token(token) if token is not None else get_c4d_token()
+        )
         port = get_c4d_port()
     except ValueError as exc:
         return _error_envelope(

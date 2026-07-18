@@ -176,6 +176,20 @@ class ExternalServerTests(unittest.TestCase):
         self.assertEqual(response["error"]["code"], "CONFIG_ERROR")
         connect.assert_not_called()
 
+    def test_unsafe_configured_token_fails_before_connect(self):
+        for invalid_token in ("short-token", "가" * 32, "!" * 32, "A" * 64):
+            with self.subTest(token_kind=type(invalid_token).__name__):
+                with patch("cinema4d_mcp.server.socket.create_connection") as connect:
+                    response = server.send_to_c4d(
+                        "ping",
+                        token=invalid_token,
+                        request_id="req-1",
+                    )
+
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "CONFIG_ERROR")
+                connect.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
