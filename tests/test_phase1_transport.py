@@ -68,7 +68,7 @@ def load_plugin_module():
     )
     c4d.PLUGINTYPE_ANY = 0
     c4d.threading = types.SimpleNamespace(GeIsMainThread=lambda: True)
-    c4d.GetC4DVersion = lambda: 2023220
+    c4d.GetC4DVersion = lambda: 2023202
     c4d.SpecialEventAdd = lambda *args, **kwargs: None
     c4d.BFH_SCALEFIT = 0
     c4d.BFH_SCALE = 0
@@ -279,6 +279,10 @@ class Phase1TransportContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "estimated entropy"):
             self.make_server(token="A" * 64)
 
+    def test_format_c4d_version_uses_revision_as_minor_and_patch(self):
+        self.assertEqual(self.plugin._format_c4d_version(2023202), "2023.2.2")
+        self.assertEqual(self.plugin._format_c4d_version(2023212), "2023.2.12")
+
     def test_capabilities_report_verified_runtime_and_safe_defaults(self):
         payload = json.dumps(self.request(command="get_capabilities")).encode("utf-8") + b"\n"
         response = self.exchange(self.make_server(), [payload])
@@ -286,7 +290,7 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         result = response["result"]
         self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
-        self.assertEqual(result["cinema4d"]["version_raw"], 2023220)
+        self.assertEqual(result["cinema4d"]["version_raw"], 2023202)
         self.assertEqual(result["cinema4d"]["compatibility"], "target")
         self.assertEqual(result["tools"], ["ping", "get_capabilities"])
         self.assertTrue(all(value is False for value in result["features"].values()))

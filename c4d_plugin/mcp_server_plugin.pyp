@@ -132,12 +132,8 @@ def _format_c4d_version(raw_version):
     year = raw_version // 1000
     revision = raw_version % 1000
     minor = revision // 100
-    patch = (revision % 100) // 10
-    build = revision % 10
-    parts = [str(year), str(minor), str(patch)]
-    if build:
-        parts.append(str(build))
-    return ".".join(parts)
+    patch = revision % 100
+    return "{}.{}.{}".format(year, minor, patch)
 
 
 def _plugin_label(plugin):
