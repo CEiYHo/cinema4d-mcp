@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Manual Phase 1 certification harness for the Cinema 4D socket bridge.
+"""Manual Phase 2A transport certification harness for the C4D bridge.
 
-Run this only while the Phase 1 plugin is loaded and its server is Online. Each
+Run this only while the Phase 2A plugin is loaded and its server is Online. Each
 case opens a new TCP connection. The token is read from ``C4D_MCP_TOKEN`` and is
 never printed.
 """
@@ -100,7 +100,7 @@ def exchange(frame, port):
                 break
             response_data += chunk
             if len(response_data) > MAX_FRAME_BYTES:
-                raise SmokeFailure("response exceeded the Phase 1 size limit")
+                raise SmokeFailure("response exceeded the bridge size limit")
     finally:
         client.close()
 
@@ -134,8 +134,14 @@ def verify_capabilities(response):
         raise SmokeFailure("capabilities reported an unexpected protocol version")
     if not isinstance(result.get("bridge_version"), str):
         raise SmokeFailure("capabilities omitted bridge_version")
-    if result.get("tools") != ["ping", "get_capabilities"]:
-        raise SmokeFailure("capability tool list is not Phase 1-only")
+    if result.get("tools") != [
+        "ping",
+        "get_capabilities",
+        "get_scene_info",
+        "list_objects",
+        "get_object",
+    ]:
+        raise SmokeFailure("capability tool list is not the Phase 2A surface")
 
     cinema4d = result.get("cinema4d") or {}
     if cinema4d.get("version") != "2023.2.2":
@@ -223,7 +229,7 @@ def main():
             "recovery ping after errors",
             exchange(request_frame("ping", token), port),
         )
-        print("Phase 1 smoke certification passed")
+        print("Phase 2A transport smoke certification passed")
         return 0
     except (OSError, SmokeFailure, KeyError) as exc:
         print("FAIL {}".format(exc), file=sys.stderr)
