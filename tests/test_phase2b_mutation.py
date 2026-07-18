@@ -507,6 +507,51 @@ class Phase2BMutationTests(unittest.TestCase):
         self.assertFalse(response["error"]["retryable"])
         self.assertEqual(len(self.document.roots), 1)
 
+    def test_post_create_identity_failure_is_outcome_unknown(self):
+        identity_error = self.plugin._BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "forced post-create identity failure",
+        )
+
+        with patch.object(
+            self.plugin,
+            "_resolve_object_entry",
+            side_effect=identity_error,
+        ):
+            response = self.execute_task("create_object", {"type": "cube"})
+
+        self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(len(self.document.roots), 1)
+        self.assertIn("EndUndo", self.document.log)
+        self.assertEqual(len(self.document.undo_stack), 1)
+        self.assertNotEqual(response["error"]["code"], "OBJECT_ID_UNVERIFIED")
+
+    def test_post_create_metadata_failure_is_outcome_unknown(self):
+        with patch.object(
+            self.plugin,
+            "_mutation_object_payload",
+            side_effect=RuntimeError("forced metadata failure"),
+        ):
+            response = self.execute_task("create_object", {"type": "cube"})
+
+        self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(len(self.document.roots), 1)
+        self.assertIn("EndUndo", self.document.log)
+        self.assertEqual(len(self.document.undo_stack), 1)
+
+    def test_pre_insertion_allocation_failure_remains_mutation_failed(self):
+        self.plugin.c4d.BaseObject = MagicMock(return_value=None)
+
+        response = self.execute_task("create_object", {"type": "cube"})
+
+        self.assertEqual(response["error"]["code"], "MUTATION_FAILED")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(self.document.roots, [])
+        self.assertNotIn("InsertObject", self.document.log)
+        self.assertFalse(any(entry == ("AddUndo", "NEW") for entry in self.document.log))
+
     def test_partial_update_and_end_undo_failure_are_outcome_unknown(self):
         created = self.create(name="Before")
         object_id_value = created["object"]["object_id"]

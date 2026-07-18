@@ -1258,9 +1258,14 @@ def _create_object(doc, params):
         _capture_mutation_undo(doc, document_scope, mutation_id, "create_object")
         confirmed = _resolve_object_entry(doc, object_id)["entry"]["object"]
         object_payload = _mutation_object_payload(confirmed, object_id)
-    except _BridgeCommandError:
+    except _BridgeCommandError as exc:
         _best_effort_event_add()
-        raise
+        if exc.code == "OUTCOME_UNKNOWN":
+            raise
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was created but post-create verification did not complete",
+        )
     except Exception:
         _best_effort_event_add()
         raise _BridgeCommandError(
