@@ -239,21 +239,21 @@ class Phase2AReadContractTests(unittest.TestCase):
         self.assertTrue(task.execute())
         return task.result
 
-    def test_plugin_allowlist_is_exactly_the_five_read_only_tools(self):
+    def test_plugin_allowlist_preserves_reads_and_adds_only_phase2b_mutations(self):
         expected = (
             "ping",
             "get_capabilities",
             "get_scene_info",
             "list_objects",
             "get_object",
-        )
-        self.assertEqual(self.plugin.ACTIVE_COMMAND_NAMES, expected)
-        self.assertEqual(self.plugin.ALLOWED_COMMANDS, frozenset(expected))
-        for forbidden in (
             "create_object",
             "update_object",
             "delete_object",
             "undo_last",
+        )
+        self.assertEqual(self.plugin.ACTIVE_COMMAND_NAMES, expected)
+        self.assertEqual(self.plugin.ALLOWED_COMMANDS, frozenset(expected))
+        for forbidden in (
             "save_document",
             "save_scene",
             "execute_python",

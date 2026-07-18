@@ -62,11 +62,11 @@ def success_response(request_id="req-1"):
 
 
 class ExternalServerTests(unittest.TestCase):
-    def test_runtime_version_labels_are_phase2a3(self):
-        self.assertEqual(__version__, "0.2.0-phase2a3")
-        self.assertEqual(SERVER_VERSION, "0.2.0-phase2a3")
+    def test_runtime_version_labels_are_phase2b(self):
+        self.assertEqual(__version__, "0.3.0-phase2b")
+        self.assertEqual(SERVER_VERSION, "0.3.0-phase2b")
 
-    def test_active_mcp_surface_has_exactly_five_tools(self):
+    def test_active_mcp_surface_has_exactly_nine_tools(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         decorated_tools = []
@@ -89,6 +89,10 @@ class ExternalServerTests(unittest.TestCase):
             "get_scene_info",
             "list_objects",
             "get_object",
+            "create_object",
+            "update_object",
+            "delete_object",
+            "undo_last",
         )
         self.assertEqual(tuple(decorated_tools), expected)
         self.assertEqual(server.ACTIVE_TOOL_NAMES, expected)
@@ -283,7 +287,7 @@ class ExternalServerTests(unittest.TestCase):
     def test_capabilities_include_external_server_version(self, create_connection):
         bridge_socket = MagicMock()
         response_payload = success_response()
-        response_payload["result"] = {"bridge_version": "0.2.0-phase2a3"}
+        response_payload["result"] = {"bridge_version": "0.3.0-phase2b"}
         bridge_socket.recv.return_value = (
             json.dumps(response_payload).encode("utf-8") + b"\n"
         )
@@ -296,19 +300,15 @@ class ExternalServerTests(unittest.TestCase):
         )
 
         self.assertTrue(response["ok"])
-        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase2a3")
+        self.assertEqual(response["result"]["bridge_version"], "0.3.0-phase2b")
         self.assertEqual(
             response["result"]["mcp_server_version"],
-            "0.2.0-phase2a3",
+            "0.3.0-phase2b",
         )
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_legacy_command_is_rejected_without_connecting(self, create_connection):
         for command in (
-            "create_object",
-            "update_object",
-            "delete_object",
-            "undo_last",
             "save_document",
             "execute_python",
             "octane_command",

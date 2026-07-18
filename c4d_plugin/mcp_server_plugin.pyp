@@ -1,9 +1,9 @@
-"""Secure Phase 2A.3 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2B Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
-five allowed commands are executed from a custom CoreMessage on Cinema 4D's
-main thread. Scene and object inspection is read-only; no mutation, renderer
-control, file operation, or arbitrary-Python command is present.
+nine allowed commands are executed from a custom CoreMessage on Cinema 4D's
+main thread. Mutations are typed, undo-guarded, and never expose arbitrary
+parameters, renderer control, file operations, or Python execution.
 """
 
 import hmac
@@ -16,6 +16,7 @@ import socket
 import threading
 import time
 import sys
+import unicodedata
 
 import c4d
 from c4d import gui
@@ -24,11 +25,11 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 2A.3 Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2B Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.2.0-phase2a3"
+BRIDGE_VERSION = "0.3.0-phase2b"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
@@ -47,8 +48,18 @@ ACTIVE_COMMAND_NAMES = (
     "get_scene_info",
     "list_objects",
     "get_object",
+    "create_object",
+    "update_object",
+    "delete_object",
+    "undo_last",
 )
 ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
+WRITE_COMMAND_NAMES = frozenset(
+    ("create_object", "update_object", "delete_object", "undo_last")
+)
+CREATE_OBJECT_TYPES = frozenset(
+    ("null", "cube", "sphere", "plane", "cylinder", "cone")
+)
 OBJECT_ID_PREFIX = "c4d:"
 MAX_OBJECT_ID_LENGTH = (
     len(OBJECT_ID_PREFIX)
@@ -56,6 +67,11 @@ MAX_OBJECT_ID_LENGTH = (
     + 1
     + OBJECT_SCOPE_HEX_LENGTH
 )
+MUTATION_ID_PREFIX = "mut:"
+MUTATION_SCOPE_BYTES = 16
+MUTATION_SCOPE_HEX_LENGTH = MUTATION_SCOPE_BYTES * 2
+MAX_MUTATION_ID_LENGTH = len(MUTATION_ID_PREFIX) + MUTATION_SCOPE_HEX_LENGTH
+MAX_OBJECT_NAME_LENGTH = 255
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
 TOKEN_MIN_ESTIMATED_ENTROPY_BITS = 128
@@ -120,6 +136,14 @@ class _BridgeCommandError(Exception):
         self.code = code
         self.message = message
         self.details = details or {}
+
+
+class _CommandValidationError(ValueError):
+    """Command-specific validation failure shared by worker and main thread."""
+
+    def __init__(self, code, message):
+        super(_CommandValidationError, self).__init__(message)
+        self.code = code
 
 
 def _configured_port():
@@ -211,6 +235,32 @@ def _parse_object_id(value):
 
 def _is_valid_object_id(value):
     return _parse_object_id(value) is not None
+
+
+def _parse_mutation_id(value):
+    if not isinstance(value, str) or len(value) != MAX_MUTATION_ID_LENGTH:
+        return None
+    if not value.startswith(MUTATION_ID_PREFIX):
+        return None
+    mutation_scope = value[len(MUTATION_ID_PREFIX):]
+    if (
+        len(mutation_scope) != MUTATION_SCOPE_HEX_LENGTH
+        or not mutation_scope.isascii()
+        or any(character not in "0123456789abcdef" for character in mutation_scope)
+    ):
+        return None
+    return mutation_scope
+
+
+def _is_valid_mutation_id(value):
+    return _parse_mutation_id(value) is not None
+
+
+def _serialize_mutation_id(mutation_scope):
+    value = "{}{}".format(MUTATION_ID_PREFIX, mutation_scope)
+    if _parse_mutation_id(value) != mutation_scope:
+        raise ValueError("invalid mutation scope")
+    return value
 
 
 def _serialize_object_id(document_scope, object_scope):
@@ -323,6 +373,36 @@ class _ObjectScopeRegistry:
         if not bucket:
             self._objects.pop(document_scope, None)
 
+    def reserve_scope(self):
+        """Reserve a never-reused scope before a mutation can begin."""
+        for _ in range(16):
+            try:
+                object_scope = self._token_factory()
+            except Exception:
+                return None
+            if (
+                _is_valid_object_scope(object_scope)
+                and object_scope not in self._issued_scopes
+            ):
+                self._issued_scopes.add(object_scope)
+                return object_scope
+        return None
+
+    def register_new_object(self, document_scope, object_scope, obj):
+        """Trust-register one bridge-allocated live object under a reserved scope."""
+        if (
+            object_scope not in self._issued_scopes
+            or not _is_valid_document_scope(document_scope)
+            or _atom_liveness(obj) is not True
+        ):
+            return False
+        self._prune_dead(document_scope)
+        bucket = self._objects.setdefault(document_scope, {})
+        if object_scope in bucket:
+            return False
+        bucket[object_scope] = obj
+        return True
+
     def scope_for(self, document_scope, obj):
         liveness = _atom_liveness(obj)
         if liveness is False:
@@ -349,18 +429,10 @@ class _ObjectScopeRegistry:
         if matching_scopes:
             return matching_scopes[0], None
 
-        for _ in range(16):
-            try:
-                object_scope = self._token_factory()
-            except Exception:
-                return None, "OBJECT_ID_UNAVAILABLE"
-            if (
-                _is_valid_object_scope(object_scope)
-                and object_scope not in self._issued_scopes
-            ):
-                self._issued_scopes.add(object_scope)
-                bucket[object_scope] = obj
-                return object_scope, None
+        object_scope = self.reserve_scope()
+        if object_scope is not None:
+            bucket[object_scope] = obj
+            return object_scope, None
         return None, "OBJECT_ID_UNAVAILABLE"
 
     def lookup(self, document_scope, object_scope):
@@ -385,8 +457,87 @@ class _ObjectScopeRegistry:
 _OBJECT_SCOPES = _ObjectScopeRegistry()
 
 
+class _MutationLedger:
+    """Track MCP-owned undo tops without trusting unrelated Cinema 4D undo work."""
+
+    def __init__(self, token_factory=None):
+        self._token_factory = token_factory or (
+            lambda: secrets.token_hex(MUTATION_SCOPE_BYTES)
+        )
+        self._entries = {}
+        self._by_id = {}
+        self._issued_ids = set()
+
+    def retain_documents(self, document_scopes):
+        for document_scope in list(self._entries):
+            if document_scope not in document_scopes:
+                for entry in self._entries.pop(document_scope):
+                    self._by_id.pop(entry["mutation_id"], None)
+
+    def reserve_id(self):
+        for _ in range(16):
+            try:
+                mutation_scope = self._token_factory()
+                mutation_id = _serialize_mutation_id(mutation_scope)
+            except Exception:
+                continue
+            if mutation_id not in self._issued_ids:
+                self._issued_ids.add(mutation_id)
+                return mutation_id
+        return None
+
+    def record(self, mutation_id, document_scope, undo_anchor, operation_kind):
+        if (
+            mutation_id not in self._issued_ids
+            or mutation_id in self._by_id
+            or _atom_liveness(undo_anchor) is not True
+        ):
+            return False
+        entry = {
+            "mutation_id": mutation_id,
+            "document_scope": document_scope,
+            "undo_anchor": undo_anchor,
+            "operation_kind": operation_kind,
+        }
+        self._entries.setdefault(document_scope, []).append(entry)
+        self._by_id[mutation_id] = document_scope
+        return True
+
+    def requested_top(self, document_scope, mutation_id):
+        owner_scope = self._by_id.get(mutation_id)
+        if owner_scope is None:
+            return None, "unavailable"
+        if owner_scope != document_scope:
+            return None, "document_mismatch"
+        entries = self._entries.get(document_scope) or []
+        if not entries:
+            return None, "unavailable"
+        entry = entries[-1]
+        if entry["mutation_id"] != mutation_id:
+            return None, "not_top"
+        return entry, "top"
+
+    def pop_top(self, document_scope, mutation_id):
+        entries = self._entries.get(document_scope) or []
+        if not entries or entries[-1]["mutation_id"] != mutation_id:
+            return False
+        entry = entries.pop()
+        self._by_id.pop(entry["mutation_id"], None)
+        if not entries:
+            self._entries.pop(document_scope, None)
+        return True
+
+    def has_entries(self, document_scope):
+        return bool(self._entries.get(document_scope))
+
+
+_MUTATION_LEDGER = _MutationLedger()
+
+
 def _sync_object_document_buckets():
-    _OBJECT_SCOPES.retain_documents(_DOCUMENT_SCOPES.live_scopes())
+    document_scopes = _DOCUMENT_SCOPES.live_scopes()
+    _OBJECT_SCOPES.retain_documents(document_scopes)
+    _MUTATION_LEDGER.retain_documents(document_scopes)
 
 
 def _walk_document_hierarchy(doc):
@@ -563,6 +714,97 @@ def _validated_list_params(params):
     return {"offset": offset, "limit": limit}
 
 
+def _validated_name(value):
+    if not isinstance(value, str):
+        raise ValueError("name must be a string")
+    if len(value) > MAX_OBJECT_NAME_LENGTH:
+        raise ValueError(
+            "name must contain at most {} characters".format(
+                MAX_OBJECT_NAME_LENGTH
+            )
+        )
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError("name must not contain control characters")
+    return value
+
+
+def _validated_vector(value, field_name):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError("{} must be an array of exactly 3 numbers".format(field_name))
+    values = []
+    for component in value:
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise ValueError("{} must contain finite numbers".format(field_name))
+        try:
+            normalized = float(component)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("{} must contain finite numbers".format(field_name))
+        if not math.isfinite(normalized):
+            raise ValueError("{} must contain finite numbers".format(field_name))
+        values.append(normalized)
+    return values
+
+
+def _validated_create_params(params):
+    allowed = {"type", "name", "position", "rotation_deg", "scale"}
+    if set(params) - allowed or "type" not in params:
+        raise ValueError("create_object requires type and only typed creation fields")
+    object_type = params.get("type")
+    if not isinstance(object_type, str) or object_type not in CREATE_OBJECT_TYPES:
+        raise _CommandValidationError(
+            "UNSUPPORTED_OBJECT_TYPE",
+            "type must be one of: {}".format(", ".join(sorted(CREATE_OBJECT_TYPES))),
+        )
+    validated = {"type": object_type}
+    if "name" in params:
+        validated["name"] = _validated_name(params["name"])
+    for field_name in ("position", "rotation_deg", "scale"):
+        if field_name in params:
+            validated[field_name] = _validated_vector(
+                params[field_name], field_name
+            )
+    return validated
+
+
+def _validated_update_params(params):
+    mutable_fields = {"name", "position", "rotation_deg", "scale"}
+    allowed = mutable_fields | {"object_id"}
+    if set(params) - allowed or "object_id" not in params:
+        raise ValueError("update_object requires object_id and only typed fields")
+    if not _is_valid_object_id(params.get("object_id")):
+        raise ValueError("update_object requires one canonical object_id")
+    if not set(params).intersection(mutable_fields):
+        raise ValueError("update_object requires at least one mutable field")
+    validated = {"object_id": params["object_id"]}
+    if "name" in params:
+        validated["name"] = _validated_name(params["name"])
+    for field_name in ("position", "rotation_deg", "scale"):
+        if field_name in params:
+            validated[field_name] = _validated_vector(
+                params[field_name], field_name
+            )
+    return validated
+
+
+def _validated_delete_params(params):
+    if set(params) - {"object_id", "recursive"} or "object_id" not in params:
+        raise ValueError("delete_object requires object_id and optional recursive")
+    if not _is_valid_object_id(params.get("object_id")):
+        raise ValueError("delete_object requires one canonical object_id")
+    recursive = params.get("recursive", False)
+    if not isinstance(recursive, bool):
+        raise ValueError("recursive must be a boolean")
+    return {"object_id": params["object_id"], "recursive": recursive}
+
+
+def _validated_undo_params(params):
+    if set(params) != {"mutation_id"} or not _is_valid_mutation_id(
+        params.get("mutation_id")
+    ):
+        raise ValueError("undo_last requires one canonical mutation_id")
+    return {"mutation_id": params["mutation_id"]}
+
+
 def _validated_command_params(command, params):
     if command == "get_object":
         if set(params.keys()) != {"object_id"} or not _is_valid_object_id(
@@ -572,6 +814,14 @@ def _validated_command_params(command, params):
         return {"object_id": params["object_id"]}
     if command == "list_objects":
         return _validated_list_params(params)
+    if command == "create_object":
+        return _validated_create_params(params)
+    if command == "update_object":
+        return _validated_update_params(params)
+    if command == "delete_object":
+        return _validated_delete_params(params)
+    if command == "undo_last":
+        return _validated_undo_params(params)
     if command in ALLOWED_COMMANDS:
         if params:
             raise ValueError("This command does not accept parameters")
@@ -657,7 +907,8 @@ def _rotation_degree_values(rotation):
     return values
 
 
-def _read_object(doc, object_id):
+def _resolve_object_entry(doc, object_id):
+    """Resolve one opaque ID to exactly one current hierarchy wrapper."""
     parsed = _parse_object_id(object_id)
     if parsed is None:
         raise _BridgeCommandError(
@@ -745,6 +996,22 @@ def _read_object(doc, object_id):
             "The object scope could not be confirmed in the active hierarchy",
         )
 
+    return {
+        "document_scope": document_scope,
+        "entries": entries,
+        "identity_by_object": identity_by_object,
+        "identity_error_by_object": identity_error_by_object,
+        "entry": entry,
+    }
+
+
+def _read_object(doc, object_id):
+    resolved = _resolve_object_entry(doc, object_id)
+    entries = resolved["entries"]
+    identity_by_object = resolved["identity_by_object"]
+    identity_error_by_object = resolved["identity_error_by_object"]
+    entry = resolved["entry"]
+
     obj = entry["object"]
     parent = entry["parent"]
     parent_id = (
@@ -787,6 +1054,499 @@ def _read_object(doc, object_id):
     if parent is not None and parent_id is None:
         result["parent_id_error"] = identity_error_by_object[id(parent)]
     return result
+
+
+def _creation_type_symbols():
+    """Resolve only documented built-in symbols on the Cinema 4D main thread."""
+    return {
+        "null": c4d.Onull,
+        "cube": c4d.Ocube,
+        "sphere": c4d.Osphere,
+        "plane": c4d.Oplane,
+        "cylinder": c4d.Ocylinder,
+        "cone": c4d.Ocone,
+    }
+
+
+def _c4d_vector(values):
+    return c4d.Vector(values[0], values[1], values[2])
+
+
+def _rotation_radian_vector(values):
+    return c4d.Vector(
+        c4d.utils.DegToRad(values[0]),
+        c4d.utils.DegToRad(values[1]),
+        c4d.utils.DegToRad(values[2]),
+    )
+
+
+def _apply_typed_object_fields(obj, params):
+    if "name" in params:
+        obj.SetName(params["name"])
+    if "position" in params:
+        obj.SetRelPos(_c4d_vector(params["position"]))
+    if "rotation_deg" in params:
+        obj.SetRelRot(_rotation_radian_vector(params["rotation_deg"]))
+    if "scale" in params:
+        obj.SetRelScale(_c4d_vector(params["scale"]))
+
+
+def _mutation_object_payload(obj, object_id):
+    return {
+        "object_id": object_id,
+        "name": _object_name(obj),
+        "type_id": _runtime_type_id(obj),
+        "type_name": _safe_type_name(obj),
+        "position": _vector_values(obj.GetRelPos()),
+        "rotation_deg": _rotation_degree_values(obj.GetRelRot()),
+        "scale": _vector_values(obj.GetRelScale()),
+    }
+
+
+def _best_effort_end_undo(doc):
+    try:
+        return doc.EndUndo() is True
+    except Exception:
+        return False
+
+
+def _best_effort_event_add():
+    try:
+        c4d.EventAdd()
+        return True
+    except Exception:
+        return False
+
+
+def _stop_all_threads_or_error(code="MUTATION_FAILED"):
+    try:
+        c4d.StopAllThreads()
+    except Exception:
+        raise _BridgeCommandError(
+            code,
+            "Cinema 4D could not stop scene-reading background threads",
+        )
+
+
+def _reserve_mutation_id():
+    mutation_id = _MUTATION_LEDGER.reserve_id()
+    if mutation_id is None:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "A mutation identifier could not be allocated",
+        )
+    return mutation_id
+
+
+def _capture_mutation_undo(doc, document_scope, mutation_id, operation_kind):
+    try:
+        undo_anchor = doc.GetUndoPtr()
+    except Exception:
+        undo_anchor = None
+    if undo_anchor is None or _atom_liveness(undo_anchor) is not True:
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The scene changed but its Cinema 4D undo anchor could not be verified",
+        )
+    try:
+        recorded = _MUTATION_LEDGER.record(
+            mutation_id,
+            document_scope,
+            undo_anchor,
+            operation_kind,
+        )
+    except Exception:
+        recorded = False
+    if not recorded:
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The scene changed but its MCP undo ledger could not be recorded",
+        )
+
+
+def _prepare_mutation_document(doc):
+    try:
+        document_scope = _DOCUMENT_SCOPES.scope_for(doc)
+        _sync_object_document_buckets()
+    except Exception:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "The active document identity could not be prepared for mutation",
+        )
+    mutation_id = _reserve_mutation_id()
+    return document_scope, mutation_id
+
+
+def _create_object(doc, params):
+    document_scope, mutation_id = _prepare_mutation_document(doc)
+    object_scope = _OBJECT_SCOPES.reserve_scope()
+    if object_scope is None:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "An object identifier could not be allocated",
+        )
+    try:
+        type_id = _creation_type_symbols()[params["type"]]
+    except Exception:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not resolve the requested built-in object type",
+        )
+
+    _stop_all_threads_or_error()
+    try:
+        started = doc.StartUndo()
+    except Exception:
+        started = False
+    if started is not True:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not start the create undo transaction",
+        )
+
+    inserted_may_have_occurred = False
+    try:
+        obj = c4d.BaseObject(type_id)
+        if obj is None or _atom_liveness(obj) is not True:
+            raise RuntimeError("Cinema 4D did not allocate a live BaseObject")
+        _apply_typed_object_fields(obj, params)
+        inserted_may_have_occurred = True
+        doc.InsertObject(obj)
+        if doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, obj) is not True:
+            _best_effort_end_undo(doc)
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "The object may have been inserted without a verified undo entry",
+            )
+        if doc.EndUndo() is not True:
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "The object was inserted but the undo transaction did not close",
+            )
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        _best_effort_end_undo(doc)
+        if inserted_may_have_occurred:
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "Cinema 4D may have partially created the object",
+            )
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not create the object before scene insertion",
+        )
+
+    try:
+        registered = _OBJECT_SCOPES.register_new_object(
+            document_scope, object_scope, obj
+        )
+        object_id = _serialize_object_id(document_scope, object_scope)
+    except Exception:
+        registered = False
+        object_id = None
+    if not registered:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was created but its object_id could not be registered",
+        )
+    try:
+        _capture_mutation_undo(doc, document_scope, mutation_id, "create_object")
+        confirmed = _resolve_object_entry(doc, object_id)["entry"]["object"]
+        object_payload = _mutation_object_payload(confirmed, object_id)
+    except _BridgeCommandError:
+        _best_effort_event_add()
+        raise
+    except Exception:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was created but its response metadata could not be verified",
+        )
+    if not _best_effort_event_add():
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was created but Cinema 4D did not accept the update event",
+        )
+    return {
+        "mutation_id": mutation_id,
+        "object": object_payload,
+        "undo_available": True,
+    }
+
+
+def _update_object(doc, params):
+    resolved = _resolve_object_entry(doc, params["object_id"])
+    obj = resolved["entry"]["object"]
+    document_scope, mutation_id = _prepare_mutation_document(doc)
+    if document_scope != resolved["document_scope"]:
+        raise _BridgeCommandError(
+            "DOCUMENT_ID_UNVERIFIED",
+            "The active document scope changed before mutation",
+        )
+
+    _stop_all_threads_or_error()
+    try:
+        started = doc.StartUndo()
+    except Exception:
+        started = False
+    if started is not True:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not start the update undo transaction",
+        )
+    try:
+        if doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj) is not True:
+            _best_effort_end_undo(doc)
+            raise _BridgeCommandError(
+                "MUTATION_FAILED",
+                "Cinema 4D rejected the update undo entry",
+            )
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        _best_effort_end_undo(doc)
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not add the update undo entry",
+        )
+
+    mutation_may_have_occurred = True
+    try:
+        _apply_typed_object_fields(obj, params)
+        if doc.EndUndo() is not True:
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "The object changed but the undo transaction did not close",
+            )
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        _best_effort_end_undo(doc)
+        if mutation_may_have_occurred:
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "Cinema 4D may have partially updated the object",
+            )
+
+    try:
+        _capture_mutation_undo(doc, document_scope, mutation_id, "update_object")
+        confirmed = _resolve_object_entry(
+            doc, params["object_id"]
+        )["entry"]["object"]
+        object_payload = _mutation_object_payload(
+            confirmed, params["object_id"]
+        )
+    except _BridgeCommandError:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object changed but its final identity could not be verified",
+        )
+    except Exception:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object changed but its response metadata could not be verified",
+        )
+    if not _best_effort_event_add():
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object changed but Cinema 4D did not accept the update event",
+        )
+    return {
+        "mutation_id": mutation_id,
+        "object": object_payload,
+        "undo_available": True,
+    }
+
+
+def _delete_object(doc, params):
+    resolved = _resolve_object_entry(doc, params["object_id"])
+    obj = resolved["entry"]["object"]
+    if not params["recursive"] and obj.GetDown() is not None:
+        raise _BridgeCommandError(
+            "OBJECT_HAS_CHILDREN",
+            "The object has children; set recursive=true to delete its subtree",
+        )
+    deleted_metadata = {
+        "object_id": params["object_id"],
+        "name": _object_name(obj),
+        "type_id": _runtime_type_id(obj),
+        "type_name": _safe_type_name(obj),
+    }
+    document_scope, mutation_id = _prepare_mutation_document(doc)
+    if document_scope != resolved["document_scope"]:
+        raise _BridgeCommandError(
+            "DOCUMENT_ID_UNVERIFIED",
+            "The active document scope changed before mutation",
+        )
+
+    _stop_all_threads_or_error()
+    try:
+        started = doc.StartUndo()
+    except Exception:
+        started = False
+    if started is not True:
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not start the delete undo transaction",
+        )
+    try:
+        if doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, obj) is not True:
+            _best_effort_end_undo(doc)
+            raise _BridgeCommandError(
+                "MUTATION_FAILED",
+                "Cinema 4D rejected the delete undo entry",
+            )
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        _best_effort_end_undo(doc)
+        raise _BridgeCommandError(
+            "MUTATION_FAILED",
+            "Cinema 4D could not add the delete undo entry",
+        )
+
+    try:
+        obj.Remove()
+        if doc.EndUndo() is not True:
+            _best_effort_event_add()
+            raise _BridgeCommandError(
+                "OUTCOME_UNKNOWN",
+                "The object was removed but the undo transaction did not close",
+            )
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        _best_effort_end_undo(doc)
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D may have partially deleted the object",
+        )
+
+    try:
+        _capture_mutation_undo(doc, document_scope, mutation_id, "delete_object")
+    except _BridgeCommandError:
+        _best_effort_event_add()
+        raise
+    except Exception:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was deleted but its undo state could not be verified",
+        )
+    if not _best_effort_event_add():
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was deleted but Cinema 4D did not accept the update event",
+        )
+    return {
+        "mutation_id": mutation_id,
+        "deleted_object_id": params["object_id"],
+        "deleted_object": deleted_metadata,
+        "recursive": params["recursive"],
+        "undo_available": True,
+    }
+
+
+def _undo_last(doc, params):
+    document_scope = _DOCUMENT_SCOPES.scope_for(doc)
+    _sync_object_document_buckets()
+    mutation_id = params["mutation_id"]
+    entry, status = _MUTATION_LEDGER.requested_top(document_scope, mutation_id)
+    if status == "unavailable":
+        raise _BridgeCommandError(
+            "UNDO_NOT_AVAILABLE",
+            "No matching MCP mutation is available for undo",
+        )
+    if status == "document_mismatch":
+        raise _BridgeCommandError(
+            "DOCUMENT_MISMATCH",
+            "The mutation_id belongs to a different document scope",
+        )
+    if status != "top":
+        raise _BridgeCommandError(
+            "UNDO_STATE_MISMATCH",
+            "The requested mutation is not the top MCP mutation",
+        )
+
+    try:
+        current_anchor = doc.GetUndoPtr()
+    except Exception:
+        current_anchor = None
+    stored_anchor = entry["undo_anchor"]
+    if (
+        current_anchor is None
+        or _atom_liveness(current_anchor) is not True
+        or _atom_liveness(stored_anchor) is not True
+        or _same_atom(stored_anchor, current_anchor) is not True
+    ):
+        raise _BridgeCommandError(
+            "UNDO_STATE_MISMATCH",
+            "Cinema 4D undo state no longer matches the MCP mutation",
+        )
+
+    _stop_all_threads_or_error("UNDO_FAILED")
+    try:
+        undo_succeeded = doc.DoUndo()
+    except Exception:
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D may have partially processed the undo",
+        )
+    if undo_succeeded is not True:
+        raise _BridgeCommandError(
+            "UNDO_FAILED",
+            "Cinema 4D did not complete the undo operation",
+        )
+    try:
+        ledger_advanced = _MUTATION_LEDGER.pop_top(document_scope, mutation_id)
+    except Exception:
+        ledger_advanced = False
+    if not ledger_advanced:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D undid the mutation but the MCP ledger did not advance",
+        )
+    if not _best_effort_event_add():
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D undid the mutation but did not accept the update event",
+        )
+    return {
+        "undone_mutation_id": mutation_id,
+        "operation": entry["operation_kind"],
+        "undo_available": _MUTATION_LEDGER.has_entries(document_scope),
+    }
+
+
+def _dispatch_mutation_command(command, params):
+    try:
+        params = _validated_command_params(command, params)
+    except _CommandValidationError as exc:
+        raise _BridgeCommandError(exc.code, str(exc))
+    except ValueError as exc:
+        raise _BridgeCommandError("INVALID_PARAMS", str(exc))
+
+    doc = _require_active_document()
+    if command == "create_object":
+        return _create_object(doc, params)
+    if command == "update_object":
+        return _update_object(doc, params)
+    if command == "delete_object":
+        return _delete_object(doc, params)
+    if command == "undo_last":
+        return _undo_last(doc, params)
+    raise _BridgeCommandError("UNKNOWN_COMMAND", "Unsupported mutation command")
 
 
 def _dispatch_read_command(command, params, request_id=None):
@@ -1293,7 +2053,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 2A.3",
+                        "Command is not available in Phase 2B",
                         retryable=False,
                     ),
                 )
@@ -1384,6 +2144,8 @@ class C4DSocketServer(threading.Thread):
                     request["command"],
                     request["params"],
                 )
+            except _CommandValidationError as exc:
+                return (exc.code, str(exc))
             except ValueError as exc:
                 return ("INVALID_PARAMS", str(exc))
         return None
@@ -1486,8 +2248,8 @@ class C4DSocketServer(threading.Thread):
                 "tools": list(ACTIVE_COMMAND_NAMES),
                 "features": {
                     "scene_read": True,
-                    "object_operations": False,
-                    "undo": False,
+                    "object_operations": True,
+                    "undo": True,
                     "save": False,
                     "animation": False,
                     "camera": False,
@@ -1508,7 +2270,9 @@ class C4DSocketServer(threading.Thread):
             }
         if command in ("get_scene_info", "list_objects", "get_object"):
             return _dispatch_read_command(command, params, request_id)
-        raise ValueError("unsupported Phase 2A.3 command")
+        if command in WRITE_COMMAND_NAMES:
+            return _dispatch_mutation_command(command, params)
+        raise ValueError("unsupported Phase 2B command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -1527,7 +2291,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 2A.3 Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2B Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
@@ -1703,6 +2467,6 @@ if __name__ == "__main__":
         PLUGIN_NAME,
         0,
         None,
-        "Secure localhost-only MCP Phase 2A.3 bridge",
+        "Secure localhost-only MCP Phase 2B bridge",
         SocketServerPlugin(),
     )

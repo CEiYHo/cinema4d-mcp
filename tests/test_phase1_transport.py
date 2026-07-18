@@ -219,8 +219,8 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertFalse(delayed_callback())
         server._dispatch_on_main_thread.assert_not_called()
 
-    def test_legacy_command_is_not_dispatchable(self):
-        payload = json.dumps(self.request(command="create_object")).encode("utf-8") + b"\n"
+    def test_forbidden_command_is_not_dispatchable(self):
+        payload = json.dumps(self.request(command="save_document")).encode("utf-8") + b"\n"
         response = self.exchange(self.make_server(), [payload])
 
         self.assertFalse(response["ok"])
@@ -293,7 +293,7 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
         self.assertEqual(result["cinema4d"]["version_raw"], 2023202)
         self.assertEqual(result["cinema4d"]["compatibility"], "target")
-        self.assertEqual(result["bridge_version"], "0.2.0-phase2a3")
+        self.assertEqual(result["bridge_version"], "0.3.0-phase2b")
         self.assertEqual(
             result["tools"],
             [
@@ -302,14 +302,20 @@ class Phase1TransportContractTests(unittest.TestCase):
                 "get_scene_info",
                 "list_objects",
                 "get_object",
+                "create_object",
+                "update_object",
+                "delete_object",
+                "undo_last",
             ],
         )
         self.assertTrue(result["features"]["scene_read"])
+        self.assertTrue(result["features"]["object_operations"])
+        self.assertTrue(result["features"]["undo"])
         self.assertTrue(
             all(
                 value is False
                 for name, value in result["features"].items()
-                if name != "scene_read"
+                if name not in ("scene_read", "object_operations", "undo")
             )
         )
         self.assertFalse(result["renderers"]["octane"]["installed"])
