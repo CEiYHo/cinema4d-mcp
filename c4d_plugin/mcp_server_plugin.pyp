@@ -1,4 +1,4 @@
-"""Secure Phase 2A.1 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2A.2 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
 five allowed commands are executed from a custom CoreMessage on Cinema 4D's
@@ -24,11 +24,11 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 2A.1 Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2A.2 Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.2.0-phase2a1"
+BRIDGE_VERSION = "0.2.0-phase2a2"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
@@ -242,11 +242,11 @@ def _object_id_or_none(obj, document_scope):
 
 
 class _DocumentScopeRegistry:
-    """Bind random scopes to exact retained document wrapper capabilities.
+    """Bind random scopes to live underlying Cinema 4D documents.
 
     Cinema 4D 2023.2 exposes no documented stable BaseDocument identifier in
-    Python. A strong reference prevents Python identity reuse. If C4D returns a
-    different wrapper, the registry does not guess that it is the same document.
+    Python. C4DAtom equality identifies wrappers pointing to the same underlying
+    atom, while IsAlive prevents a retained dead wrapper from matching later.
     """
 
     def __init__(self, token_factory=None):
@@ -255,9 +255,33 @@ class _DocumentScopeRegistry:
         )
         self._documents = {}
 
+    @staticmethod
+    def _is_alive(doc):
+        try:
+            alive = doc.IsAlive()
+        except Exception:
+            return False
+        return alive is True
+
+    @staticmethod
+    def _same_atom(left, right):
+        try:
+            same = left == right
+        except Exception:
+            return None
+        return same if isinstance(same, bool) else None
+
+    def _prune_dead(self):
+        for document_scope, registered_doc in list(self._documents.items()):
+            if not self._is_alive(registered_doc):
+                del self._documents[document_scope]
+
     def scope_for(self, doc):
+        if not self._is_alive(doc):
+            raise RuntimeError("Active document is not a live C4DAtom")
+        self._prune_dead()
         for document_scope, registered_doc in self._documents.items():
-            if registered_doc is doc:
+            if self._same_atom(registered_doc, doc) is True:
                 return document_scope
         for _ in range(16):
             document_scope = self._token_factory()
@@ -270,12 +294,18 @@ class _DocumentScopeRegistry:
         raise RuntimeError("Could not allocate a document scope")
 
     def status(self, doc, document_scope):
+        self._prune_dead()
         registered_doc = self._documents.get(document_scope)
         if registered_doc is None:
             return "stale"
-        if registered_doc is not doc:
+        if not self._is_alive(doc):
+            return "unverified"
+        same = self._same_atom(registered_doc, doc)
+        if same is True:
+            return "current"
+        if same is False:
             return "mismatch"
-        return "current"
+        return "unverified"
 
 
 _DOCUMENT_SCOPES = _DocumentScopeRegistry()
@@ -530,6 +560,11 @@ def _read_object(doc, object_id):
         raise _BridgeCommandError(
             "DOCUMENT_MISMATCH",
             "The object_id belongs to a different document scope",
+        )
+    if scope_status == "unverified":
+        raise _BridgeCommandError(
+            "DOCUMENT_ID_UNVERIFIED",
+            "The active document identity could not be verified",
         )
 
     entries, identity_by_object, _ = _build_identity_snapshot(
@@ -1099,7 +1134,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 2A.1",
+                        "Command is not available in Phase 2A.2",
                         retryable=False,
                     ),
                 )
@@ -1314,7 +1349,7 @@ class C4DSocketServer(threading.Thread):
             }
         if command in ("get_scene_info", "list_objects", "get_object"):
             return _dispatch_read_command(command, params, request_id)
-        raise ValueError("unsupported Phase 2A.1 command")
+        raise ValueError("unsupported Phase 2A.2 command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -1333,7 +1368,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 2A.1 Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2A.2 Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
@@ -1509,6 +1544,6 @@ if __name__ == "__main__":
         PLUGIN_NAME,
         0,
         None,
-        "Secure localhost-only MCP Phase 2A.1 bridge",
+        "Secure localhost-only MCP Phase 2A.2 bridge",
         SocketServerPlugin(),
     )
