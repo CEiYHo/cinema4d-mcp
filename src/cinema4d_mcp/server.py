@@ -1,4 +1,4 @@
-"""Phase 2A.2 MCP server exposing a hardened read-only Cinema 4D surface."""
+"""Phase 2A.3 MCP server exposing a hardened read-only Cinema 4D surface."""
 
 from __future__ import annotations
 
@@ -207,7 +207,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "UNKNOWN_COMMAND",
-            "Command is not available in Phase 2A.2",
+            "Command is not available in Phase 2A.3",
         )
 
     request_id = request_id or uuid.uuid4().hex
@@ -263,7 +263,7 @@ def send_to_c4d(
                     "C4D_UNAVAILABLE",
                     "Cinema 4D closed the connection without a response",
                     retryable=True,
-                    user_action="Confirm the Phase 2A.2 bridge is running in Cinema 4D",
+                    user_action="Confirm the Phase 2A.3 bridge is running in Cinema 4D",
                 )
             response_data += chunk
             if len(response_data) > MAX_FRAME_BYTES:
@@ -308,7 +308,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_TIMEOUT",
-            "Timed out waiting for the Cinema 4D Phase 2A.2 bridge",
+            "Timed out waiting for the Cinema 4D Phase 2A.3 bridge",
             retryable=True,
             user_action="Confirm Cinema 4D is responsive and retry ping",
         )
@@ -321,9 +321,9 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_UNAVAILABLE",
-            "Could not connect to the Cinema 4D Phase 2A.2 bridge",
+            "Could not connect to the Cinema 4D Phase 2A.3 bridge",
             retryable=True,
-            user_action="Start the authenticated Phase 2A.2 bridge in Cinema 4D",
+            user_action="Start the authenticated Phase 2A.3 bridge in Cinema 4D",
         )
     except Exception as exc:
         logger.error(
@@ -355,7 +355,7 @@ async def ping() -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_capabilities() -> Dict[str, Any]:
-    """Report verified Phase 2A.2 capabilities; has no scene side effects."""
+    """Report verified Phase 2A.3 capabilities; has no scene side effects."""
     return await asyncio.to_thread(send_to_c4d, "get_capabilities")
 
 

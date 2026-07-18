@@ -62,9 +62,9 @@ def success_response(request_id="req-1"):
 
 
 class ExternalServerTests(unittest.TestCase):
-    def test_runtime_version_labels_are_phase2a2(self):
-        self.assertEqual(__version__, "0.2.0-phase2a2")
-        self.assertEqual(SERVER_VERSION, "0.2.0-phase2a2")
+    def test_runtime_version_labels_are_phase2a3(self):
+        self.assertEqual(__version__, "0.2.0-phase2a3")
+        self.assertEqual(SERVER_VERSION, "0.2.0-phase2a3")
 
     def test_active_mcp_surface_has_exactly_five_tools(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
@@ -283,7 +283,7 @@ class ExternalServerTests(unittest.TestCase):
     def test_capabilities_include_external_server_version(self, create_connection):
         bridge_socket = MagicMock()
         response_payload = success_response()
-        response_payload["result"] = {"bridge_version": "0.2.0-phase2a2"}
+        response_payload["result"] = {"bridge_version": "0.2.0-phase2a3"}
         bridge_socket.recv.return_value = (
             json.dumps(response_payload).encode("utf-8") + b"\n"
         )
@@ -296,10 +296,10 @@ class ExternalServerTests(unittest.TestCase):
         )
 
         self.assertTrue(response["ok"])
-        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase2a2")
+        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase2a3")
         self.assertEqual(
             response["result"]["mcp_server_version"],
-            "0.2.0-phase2a2",
+            "0.2.0-phase2a3",
         )
 
     @patch("cinema4d_mcp.server.socket.create_connection")

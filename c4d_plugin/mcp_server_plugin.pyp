@@ -1,4 +1,4 @@
-"""Secure Phase 2A.2 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2A.3 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
 five allowed commands are executed from a custom CoreMessage on Cinema 4D's
@@ -24,11 +24,11 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 2A.2 Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2A.3 Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.2.0-phase2a2"
+BRIDGE_VERSION = "0.2.0-phase2a3"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
@@ -1293,7 +1293,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 2A.2",
+                        "Command is not available in Phase 2A.3",
                         retryable=False,
                     ),
                 )
@@ -1508,7 +1508,7 @@ class C4DSocketServer(threading.Thread):
             }
         if command in ("get_scene_info", "list_objects", "get_object"):
             return _dispatch_read_command(command, params, request_id)
-        raise ValueError("unsupported Phase 2A.2 command")
+        raise ValueError("unsupported Phase 2A.3 command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -1527,7 +1527,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 2A.2 Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2A.3 Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
@@ -1703,6 +1703,6 @@ if __name__ == "__main__":
         PLUGIN_NAME,
         0,
         None,
-        "Secure localhost-only MCP Phase 2A.2 bridge",
+        "Secure localhost-only MCP Phase 2A.3 bridge",
         SocketServerPlugin(),
     )
