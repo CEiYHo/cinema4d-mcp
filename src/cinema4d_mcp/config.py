@@ -63,3 +63,11 @@ def validate_c4d_token(token):
 
 def get_c4d_token():
     return validate_c4d_token(os.environ.get("C4D_MCP_TOKEN"))
+
+
+def validate_startup_configuration():
+    """Validate all configuration required before FastMCP is imported."""
+    return {
+        "token": get_c4d_token(),
+        "port": get_c4d_port(),
+    }

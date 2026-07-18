@@ -2,7 +2,6 @@
 """Fail-closed entry point for the Cinema 4D Phase 1 MCP server."""
 
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -20,18 +19,10 @@ def main():
     if str(project_src) not in sys.path:
         sys.path.insert(0, str(project_src))
 
-    if not os.environ.get("C4D_MCP_TOKEN"):
-        logger.error(
-            "C4D_MCP_TOKEN is required. Configure it for both Codex and Cinema 4D, "
-            "then restart both applications."
-        )
-        return 2
-
     try:
         from cinema4d_mcp import main as package_main
 
-        package_main()
-        return 0
+        return package_main()
     except Exception as exc:
         logger.error("MCP server startup failed: %s", type(exc).__name__)
         return 1
