@@ -1,9 +1,9 @@
 """Secure Phase 1 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
-two allowed commands are executed by the dialog timer on Cinema 4D's main
-thread. No scene, object, renderer-control, file, or arbitrary-Python command
-is present in this Phase 1 runtime.
+two allowed commands are executed from a custom CoreMessage on Cinema 4D's
+main thread. No scene, object, renderer-control, file, or arbitrary-Python
+command is present in this Phase 1 runtime.
 """
 
 import hmac
@@ -24,6 +24,7 @@ from c4d import gui
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
 PLUGIN_NAME = "Cinema 4D MCP Phase 1 Bridge"
+MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
 BRIDGE_VERSION = "0.2.0-phase1"
@@ -49,6 +50,12 @@ def _success_envelope(request_id, result):
         "result": result,
         "error": None,
     }
+
+
+def _enqueue_main_thread_message(msg_queue, message_type, value):
+    """Queue work and explicitly wake Cinema 4D's main thread."""
+    msg_queue.put((message_type, value))
+    c4d.SpecialEventAdd(MAIN_THREAD_EVENT_ID)
 
 
 def _error_envelope(
@@ -315,10 +322,10 @@ class C4DSocketServer(threading.Thread):
 
     def log(self, message):
         """Queue a redacted operational message for the main-thread UI."""
-        self.msg_queue.put(("LOG", str(message)))
+        _enqueue_main_thread_message(self.msg_queue, "LOG", str(message))
 
     def update_status(self, status):
-        self.msg_queue.put(("STATUS", status))
+        _enqueue_main_thread_message(self.msg_queue, "STATUS", status)
 
     def is_stopping(self):
         return self._stop_event.is_set()
@@ -712,7 +719,7 @@ class C4DSocketServer(threading.Thread):
                 task.cancel_for_shutdown()
                 return task.result
             self._active_tasks.add(task)
-        self.msg_queue.put(("EXEC", task.execute))
+        _enqueue_main_thread_message(self.msg_queue, "EXEC", task.execute)
 
         try:
             if not task.event.wait(self.main_thread_timeout):
@@ -792,7 +799,7 @@ class C4DSocketServer(threading.Thread):
 
 
 class SocketServerDialog(gui.GeDialog):
-    """Small status dialog whose timer is the main-thread dispatcher."""
+    """Status dialog and main-thread receiver for explicit bridge wake-ups."""
 
     STATUS_TEXT_ID = 1002
     ENDPOINT_TEXT_ID = 1003
@@ -805,7 +812,6 @@ class SocketServerDialog(gui.GeDialog):
         super(SocketServerDialog, self).__init__()
         self.server = None
         self.msg_queue = queue.Queue()
-        self.SetTimer(50)
 
     def CreateLayout(self):
         self.SetTitle("Cinema 4D MCP Phase 1 Bridge")
@@ -842,6 +848,11 @@ class SocketServerDialog(gui.GeDialog):
         self.Enable(self.STOP_BUTTON_ID, False)
         return True
 
+    def InitValues(self):
+        """Start only the low-frequency lifecycle fallback after GUI init."""
+        self.SetTimer(500)
+        return True
+
     def _display_port(self):
         try:
             return _configured_port()
@@ -857,8 +868,19 @@ class SocketServerDialog(gui.GeDialog):
             return True
         return False
 
+    def CoreMessage(self, message_id, message):
+        if message_id == MAIN_THREAD_EVENT_ID:
+            self._drain_messages()
+            self._release_finished_server_reference()
+            return True
+        return c4d.gui.GeDialog.CoreMessage(self, message_id, message)
+
     def Timer(self, message):
-        self._drain_messages()
+        """Lifecycle fallback only; request dispatch uses CoreMessage()."""
+        self._release_finished_server_reference()
+        return True
+
+    def _release_finished_server_reference(self):
         if (
             self.server is not None
             and not self.server.running
@@ -866,7 +888,6 @@ class SocketServerDialog(gui.GeDialog):
         ):
             self.server = None
             self.UpdateStatusText("Offline")
-        return True
 
     def _drain_messages(self):
         while True:

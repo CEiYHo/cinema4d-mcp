@@ -34,7 +34,27 @@ def load_plugin_module():
     gui = types.ModuleType("c4d.gui")
 
     class GeDialog:
-        pass
+        def __init__(self):
+            self.strings = {}
+            self.enabled = {}
+            self.timer_values = []
+            self.base_core_messages = []
+
+        def SetTimer(self, value):
+            self.timer_values.append(value)
+
+        def SetString(self, gadget_id, value):
+            self.strings[gadget_id] = value
+
+        def GetString(self, gadget_id):
+            return self.strings.get(gadget_id, "")
+
+        def Enable(self, gadget_id, value):
+            self.enabled[gadget_id] = value
+
+        def CoreMessage(self, message_id, message):
+            self.base_core_messages.append((message_id, message))
+            return False
 
     class CommandData:
         pass
@@ -392,6 +412,139 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertFalse(delayed_callback())
         server._dispatch_on_main_thread.assert_not_called()
         client.close()
+
+    def test_exec_enqueue_requests_special_main_thread_event(self):
+        server = self.make_server(main_thread_timeout=1.0)
+        response = {}
+        with patch.object(self.plugin.c4d, "SpecialEventAdd") as wake_main:
+            worker = threading.Thread(
+                target=lambda: response.setdefault(
+                    "value",
+                    server.execute_on_main_thread("ping", {}, "req-wake"),
+                ),
+                daemon=True,
+            )
+            worker.start()
+
+            message_type, callback = server.msg_queue.get(timeout=0.5)
+            self.assertEqual(message_type, "EXEC")
+            wake_main.assert_called_once_with(self.plugin.MAIN_THREAD_EVENT_ID)
+
+            server.stop(wait=True, timeout=1.0)
+            worker.join(timeout=1.0)
+            self.assertFalse(callback())
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(response["value"]["error"]["code"], "SERVER_STOPPING")
+
+    def test_custom_core_message_dispatches_ping_without_timer(self):
+        dialog = self.plugin.SocketServerDialog()
+        dialog.Timer = MagicMock()
+        server = self.make_server(
+            msg_queue=dialog.msg_queue,
+            main_thread_timeout=1.0,
+        )
+        response = {}
+
+        with patch.object(self.plugin.c4d, "SpecialEventAdd") as wake_main:
+            worker = threading.Thread(
+                target=lambda: response.setdefault(
+                    "value",
+                    server.execute_on_main_thread("ping", {}, "req-core"),
+                ),
+                daemon=True,
+            )
+            worker.start()
+
+            deadline = time.monotonic() + 0.5
+            while not wake_main.called and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(wake_main.called)
+            self.assertTrue(
+                dialog.CoreMessage(self.plugin.MAIN_THREAD_EVENT_ID, None)
+            )
+
+        worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(response["value"]["ok"])
+        self.assertEqual(response["value"]["result"]["status"], "ok")
+        dialog.Timer.assert_not_called()
+
+    def test_status_and_log_are_consumed_by_custom_core_message(self):
+        dialog = self.plugin.SocketServerDialog()
+        server = self.make_server(msg_queue=dialog.msg_queue)
+
+        with patch.object(self.plugin.c4d, "SpecialEventAdd") as wake_main:
+            server.update_status("Online")
+            server.log("Bridge ready")
+
+            self.assertNotIn(dialog.STATUS_TEXT_ID, dialog.strings)
+            self.assertNotIn(dialog.LOG_BOX_ID, dialog.strings)
+            self.assertEqual(wake_main.call_count, 2)
+            for call in wake_main.call_args_list:
+                self.assertEqual(
+                    call.args,
+                    (self.plugin.MAIN_THREAD_EVENT_ID,),
+                )
+
+            dialog.CoreMessage(self.plugin.MAIN_THREAD_EVENT_ID, None)
+
+        self.assertEqual(dialog.strings[dialog.STATUS_TEXT_ID], "Server: Online")
+        self.assertEqual(dialog.strings[dialog.LOG_BOX_ID], "Bridge ready")
+
+    def test_unrelated_core_message_delegates_to_base_implementation(self):
+        dialog = self.plugin.SocketServerDialog()
+        message = object()
+
+        with patch.object(
+            self.plugin.gui.GeDialog,
+            "CoreMessage",
+            return_value=False,
+        ) as base_core_message:
+            result = dialog.CoreMessage(987654, message)
+
+        self.assertFalse(result)
+        base_core_message.assert_called_once_with(dialog, 987654, message)
+
+    def test_timer_is_initialized_after_dialog_values(self):
+        dialog = self.plugin.SocketServerDialog()
+
+        self.assertEqual(dialog.timer_values, [])
+        self.assertTrue(dialog.InitValues())
+        self.assertEqual(dialog.timer_values, [500])
+
+    def test_stopped_task_is_not_dispatched_by_late_core_message(self):
+        dialog = self.plugin.SocketServerDialog()
+        server = self.make_server(
+            msg_queue=dialog.msg_queue,
+            main_thread_timeout=1.0,
+        )
+        server._dispatch_on_main_thread = MagicMock()
+        response = {}
+
+        with patch.object(self.plugin.c4d, "SpecialEventAdd") as wake_main:
+            worker = threading.Thread(
+                target=lambda: response.setdefault(
+                    "value",
+                    server.execute_on_main_thread("ping", {}, "req-late-core"),
+                ),
+                daemon=True,
+            )
+            worker.start()
+
+            deadline = time.monotonic() + 0.5
+            while dialog.msg_queue.empty() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertFalse(dialog.msg_queue.empty())
+
+            server.stop(wait=True, timeout=1.0)
+            worker.join(timeout=1.0)
+            dialog.CoreMessage(self.plugin.MAIN_THREAD_EVENT_ID, None)
+
+        self.assertFalse(worker.is_alive())
+        self.assertGreaterEqual(wake_main.call_count, 2)
+        self.assertEqual(response["value"]["error"]["code"], "SERVER_STOPPING")
+        server._dispatch_on_main_thread.assert_not_called()
 
 
 if __name__ == "__main__":
