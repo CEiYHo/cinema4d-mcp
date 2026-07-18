@@ -13,6 +13,14 @@ from unittest.mock import MagicMock, patch
 from tests.test_phase1_transport import TOKEN, load_plugin_module
 
 
+SCOPE_A = "a" * 32
+SCOPE_B = "b" * 32
+
+
+def object_id(guid, scope=SCOPE_A):
+    return "c4d:{}:{}".format(scope, guid)
+
+
 class FakeVector:
     def __init__(self, x=0.0, y=0.0, z=0.0):
         self.x = x
@@ -124,6 +132,10 @@ class Phase2AReadContractTests(unittest.TestCase):
 
     def setUp(self):
         self.document = FakeDocument()
+        scope_tokens = iter((SCOPE_A, SCOPE_B, "c" * 32, "d" * 32))
+        self.plugin._DOCUMENT_SCOPES = self.plugin._DocumentScopeRegistry(
+            token_factory=lambda: next(scope_tokens)
+        )
         self.plugin.c4d.documents = SimpleNamespace(
             GetActiveDocument=lambda: self.document
         )
@@ -171,6 +183,8 @@ class Phase2AReadContractTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
+            "undo_last",
+            "save_document",
             "save_scene",
             "execute_python",
             "octane_command",
@@ -217,7 +231,10 @@ class Phase2AReadContractTests(unittest.TestCase):
             {"name": "scene.c4d", "path": r"C:\scenes", "saved": True},
         )
         self.assertEqual(result["object_count"], 3)
-        self.assertEqual(result["active_object_ids"], ["c4d:101", "c4d:103"])
+        self.assertEqual(
+            result["active_object_ids"],
+            [object_id(101), object_id(103)],
+        )
 
     def test_no_active_document_is_structured(self):
         self.document = None
@@ -228,7 +245,17 @@ class Phase2AReadContractTests(unittest.TestCase):
         self.assertEqual(response["error"]["code"], "NO_ACTIVE_DOCUMENT")
 
     def test_list_objects_empty_and_flat_hierarchies(self):
-        self.assertEqual(self.dispatch("list_objects"), {"objects": []})
+        self.assertEqual(
+            self.dispatch("list_objects"),
+            {
+                "objects": [],
+                "total_count": 0,
+                "offset": 0,
+                "limit": 100,
+                "returned_count": 0,
+                "next_offset": None,
+            },
+        )
 
         first = FakeObject(101, "First", 705001, "Fake")
         second = FakeObject(102, "Second", 705002, "Fake")
@@ -262,12 +289,12 @@ class Phase2AReadContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item["object_id"] for item in objects],
-            ["c4d:101", "c4d:102", "c4d:103", "c4d:104", "c4d:105"],
+            [object_id(guid) for guid in (101, 102, 103, 104, 105)],
         )
         self.assertEqual([item["depth"] for item in objects], [0, 1, 2, 1, 0])
         self.assertEqual(
             [item["parent_id"] for item in objects],
-            [None, "c4d:101", "c4d:102", "c4d:101", None],
+            [None, object_id(101), object_id(102), object_id(101), None],
         )
         duplicates = [item for item in objects if item["name"] == "Duplicate"]
         self.assertEqual(len(duplicates), 2)
@@ -294,7 +321,7 @@ class Phase2AReadContractTests(unittest.TestCase):
             self.assertIsNone(item["object_id"])
             self.assertFalse(item["addressable"])
             self.assertEqual(item["id_error"], "OBJECT_ID_UNAVAILABLE")
-        self.assertEqual(by_name["Child"]["object_id"], "c4d:501")
+        self.assertEqual(by_name["Child"]["object_id"], object_id(501))
         self.assertIsNone(by_name["Child"]["parent_id"])
         self.assertEqual(
             by_name["Child"]["parent_id_error"],
@@ -318,7 +345,7 @@ class Phase2AReadContractTests(unittest.TestCase):
 
         objects = self.dispatch("list_objects")["objects"]
 
-        self.assertEqual([item["object_id"] for item in objects], ["c4d:101"])
+        self.assertEqual([item["object_id"] for item in objects], [object_id(101)])
         self.assertEqual(root.cache_reads, 0)
 
     def test_get_object_returns_runtime_type_relative_hpb_and_direct_children(self):
@@ -337,14 +364,19 @@ class Phase2AReadContractTests(unittest.TestCase):
         )
         parent = FakeObject(100, "Parent", 740000, "Fake", children=[target])
         self.document = FakeDocument([parent])
+        self.dispatch("list_objects")
 
-        result = self.dispatch("get_object", {"object_id": "c4d:101"})
+        result = self.dispatch("get_object", {"object_id": object_id(101)})
 
-        self.assertEqual(result["object_id"], "c4d:101")
+        self.assertEqual(result["object_id"], object_id(101))
         self.assertEqual(result["type_id"], 740001)
         self.assertEqual(result["type_name"], "Runtime Type Name")
-        self.assertEqual(result["parent_id"], "c4d:100")
-        self.assertEqual(result["children"], ["c4d:102", "c4d:103"])
+        self.assertEqual(result["parent_id"], object_id(100))
+        self.assertEqual(result["children"], [object_id(102), object_id(103)])
+        self.assertEqual(result["child_count"], 2)
+        self.assertEqual(result["addressable_child_count"], 2)
+        self.assertEqual(result["unaddressable_child_count"], 0)
+        self.assertTrue(result["children_complete"])
         self.assertEqual(result["transform"]["position"], [1.25, 100.0, -3.5])
         self.assertEqual(result["transform"]["rotation_deg"], [90.0, -45.0, 180.0])
         self.assertEqual(result["transform"]["scale"], [1.0, 2.0, 0.5])
@@ -354,9 +386,10 @@ class Phase2AReadContractTests(unittest.TestCase):
         first = FakeObject(101, "Cube", 750001, "Fake Cube")
         second = FakeObject(102, "Cube", 750002, "Fake Cube")
         self.document = FakeDocument([first, second])
+        self.dispatch("list_objects")
 
-        first_result = self.dispatch("get_object", {"object_id": "c4d:101"})
-        second_result = self.dispatch("get_object", {"object_id": "c4d:102"})
+        first_result = self.dispatch("get_object", {"object_id": object_id(101)})
+        second_result = self.dispatch("get_object", {"object_id": object_id(102)})
 
         self.assertEqual(first_result["type_id"], 750001)
         self.assertEqual(second_result["type_id"], 750002)
@@ -373,7 +406,7 @@ class Phase2AReadContractTests(unittest.TestCase):
         second_id = self.dispatch("list_objects")["objects"][0]["object_id"]
         second_get = self.dispatch("get_object", {"object_id": second_id})
 
-        self.assertEqual(first_id, "c4d:123456789")
+        self.assertEqual(first_id, object_id(123456789))
         self.assertEqual(second_id, first_id)
         self.assertEqual(first_get["name"], "Before")
         self.assertEqual(second_get["name"], "After")
@@ -382,9 +415,10 @@ class Phase2AReadContractTests(unittest.TestCase):
         duplicate_a = FakeObject(500, "A", 760001, "Fake")
         duplicate_b = FakeObject(500, "B", 760002, "Fake")
         self.document = FakeDocument([duplicate_a, duplicate_b])
+        self.dispatch("list_objects")
 
-        missing = self.execute_task("get_object", {"object_id": "c4d:999"})
-        duplicate = self.execute_task("get_object", {"object_id": "c4d:500"})
+        missing = self.execute_task("get_object", {"object_id": object_id(999)})
+        duplicate = self.execute_task("get_object", {"object_id": object_id(500)})
 
         self.assertEqual(missing["error"]["code"], "OBJECT_NOT_FOUND")
         self.assertEqual(duplicate["error"]["code"], "OBJECT_ID_UNAVAILABLE")
@@ -402,15 +436,15 @@ class Phase2AReadContractTests(unittest.TestCase):
         request = dict(
             base,
             command="get_object",
-            params={"object_id": "c4d:123"},
+            params={"object_id": object_id(123)},
         )
         self.assertIsNone(server._validate_request(request))
 
         for params in (
             {},
             {"object_id": "Cube"},
-            {"object_id": "c4d:01"},
-            {"object_id": "c4d:123", "name": "Cube"},
+            {"object_id": object_id("01")},
+            {"object_id": object_id(123), "name": "Cube"},
         ):
             request = dict(base, command="get_object", params=params)
             error = server._validate_request(request)
@@ -436,7 +470,7 @@ class Phase2AReadContractTests(unittest.TestCase):
         for command, params in (
             ("get_scene_info", {}),
             ("list_objects", {}),
-            ("get_object", {"object_id": "c4d:101"}),
+            ("get_object", {"object_id": object_id(101)}),
         ):
             with self.subTest(command=command):
                 with self.assertRaisesRegex(RuntimeError, "main thread"):

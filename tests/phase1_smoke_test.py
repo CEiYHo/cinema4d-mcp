@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Manual Phase 2A transport certification harness for the C4D bridge.
+"""Manual Phase 2A.1 transport certification harness for the C4D bridge.
 
-Run this only while the Phase 2A plugin is loaded and its server is Online. Each
+Run this only while the Phase 2A.1 plugin is loaded and its server is Online. Each
 case opens a new TCP connection. The token is read from ``C4D_MCP_TOKEN`` and is
 never printed.
 """
@@ -19,6 +19,7 @@ import uuid
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 PROTOCOL_VERSION = 1
+EXPECTED_RUNTIME_VERSION = "0.2.0-phase2a1"
 MAX_FRAME_BYTES = 64 * 1024
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
@@ -132,8 +133,13 @@ def verify_capabilities(response):
     result = response.get("result") or {}
     if result.get("protocol_version") != PROTOCOL_VERSION:
         raise SmokeFailure("capabilities reported an unexpected protocol version")
-    if not isinstance(result.get("bridge_version"), str):
-        raise SmokeFailure("capabilities omitted bridge_version")
+    if result.get("bridge_version") != EXPECTED_RUNTIME_VERSION:
+        raise SmokeFailure(
+            "expected bridge version {}, got {}".format(
+                EXPECTED_RUNTIME_VERSION,
+                result.get("bridge_version"),
+            )
+        )
     if result.get("tools") != [
         "ping",
         "get_capabilities",
@@ -141,7 +147,7 @@ def verify_capabilities(response):
         "list_objects",
         "get_object",
     ]:
-        raise SmokeFailure("capability tool list is not the Phase 2A surface")
+        raise SmokeFailure("capability tool list is not the Phase 2A.1 surface")
 
     cinema4d = result.get("cinema4d") or {}
     if cinema4d.get("version") != "2023.2.2":
@@ -150,10 +156,18 @@ def verify_capabilities(response):
                 cinema4d.get("version")
             )
         )
-    if not isinstance(cinema4d.get("version_raw"), int):
-        raise SmokeFailure("capabilities omitted the raw Cinema 4D version")
-    if not isinstance(cinema4d.get("python_version"), str):
-        raise SmokeFailure("capabilities omitted the Cinema 4D Python version")
+    if cinema4d.get("version_raw") != 2023202:
+        raise SmokeFailure(
+            "expected raw Cinema 4D version 2023202, got {}".format(
+                cinema4d.get("version_raw")
+            )
+        )
+    if cinema4d.get("python_version") != "3.10.8":
+        raise SmokeFailure(
+            "expected Cinema 4D Python 3.10.8, got {}".format(
+                cinema4d.get("python_version")
+            )
+        )
 
     octane = ((result.get("renderers") or {}).get("octane") or {})
     if octane.get("installed") not in (True, False, None):
@@ -229,7 +243,7 @@ def main():
             "recovery ping after errors",
             exchange(request_frame("ping", token), port),
         )
-        print("Phase 2A transport smoke certification passed")
+        print("Phase 2A.1 transport smoke certification passed")
         return 0
     except (OSError, SmokeFailure, KeyError) as exc:
         print("FAIL {}".format(exc), file=sys.stderr)

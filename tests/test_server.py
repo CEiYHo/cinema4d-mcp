@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import importlib.util
+import inspect
 import json
 import os
 import socket
@@ -40,10 +42,12 @@ if importlib.util.find_spec("mcp") is None:
     sys.modules["mcp.server.fastmcp"] = fastmcp_module
 
 
-from cinema4d_mcp import server
+from cinema4d_mcp import __version__, server
+from cinema4d_mcp.config import SERVER_VERSION
 
 
 TOKEN = "phase1-test-token-with-at-least-32-bytes"
+OBJECT_ID = "c4d:{}:123456789".format("a" * 32)
 SERVER_PATH = Path(__file__).resolve().parents[1] / "src" / "cinema4d_mcp" / "server.py"
 
 
@@ -58,6 +62,10 @@ def success_response(request_id="req-1"):
 
 
 class ExternalServerTests(unittest.TestCase):
+    def test_runtime_version_labels_are_phase2a1(self):
+        self.assertEqual(__version__, "0.2.0-phase2a1")
+        self.assertEqual(SERVER_VERSION, "0.2.0-phase2a1")
+
     def test_active_mcp_surface_has_exactly_five_tools(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -84,6 +92,51 @@ class ExternalServerTests(unittest.TestCase):
         )
         self.assertEqual(tuple(decorated_tools), expected)
         self.assertEqual(server.ACTIVE_TOOL_NAMES, expected)
+        signature = inspect.signature(server.list_objects)
+        self.assertEqual(signature.parameters["offset"].default, 0)
+        self.assertEqual(signature.parameters["limit"].default, 100)
+
+    def test_mcp_1281_schema_and_raw_argument_validation_are_strict(self):
+        tool = server.mcp._tool_manager.get_tool("list_objects")
+        offset_schema = tool.parameters["properties"]["offset"]
+        limit_schema = tool.parameters["properties"]["limit"]
+        self.assertEqual(offset_schema["type"], "integer")
+        self.assertEqual(offset_schema["minimum"], 0)
+        self.assertEqual(limit_schema["type"], "integer")
+        self.assertEqual(limit_schema["minimum"], 1)
+        self.assertEqual(limit_schema["maximum"], 200)
+
+        invalid_calls = (
+            ("list_objects", {"offset": True, "limit": 100}),
+            ("list_objects", {"offset": 0, "limit": 100, "extra": 1}),
+            ("get_object", {"object_id": "c4d:invalid"}),
+            ("get_object", {"object_id": OBJECT_ID, "extra": 1}),
+            ("get_scene_info", {"extra": 1}),
+        )
+        with patch("cinema4d_mcp.server.socket.create_connection") as connect:
+            for name, arguments in invalid_calls:
+                with self.subTest(name=name, arguments=arguments):
+                    response = asyncio.run(server.mcp.call_tool(name, arguments))
+                    self.assertEqual(response["error"]["code"], "INVALID_PARAMS")
+
+        connect.assert_not_called()
+
+    def test_external_object_id_validator_matches_uint64_canonical_contract(self):
+        scope = "a" * 32
+        for value in (
+            "c4d:{}:1".format(scope),
+            "c4d:{}:18446744073709551615".format(scope),
+        ):
+            self.assertTrue(server._is_valid_object_id(value))
+        for value in (
+            "c4d:{}:0".format(scope),
+            "c4d:{}:-1".format(scope),
+            "c4d:{}:+1".format(scope),
+            "c4d:{}:01".format(scope),
+            "c4d:{}:18446744073709551616".format(scope),
+            "c4d:1",
+        ):
+            self.assertFalse(server._is_valid_object_id(value))
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_authenticated_request_uses_versioned_envelope(self, create_connection):
@@ -120,12 +173,12 @@ class ExternalServerTests(unittest.TestCase):
             "get_object",
             token=TOKEN,
             request_id="req-1",
-            params={"object_id": "c4d:123456789"},
+            params={"object_id": OBJECT_ID},
         )
 
         self.assertTrue(response["ok"])
         sent = json.loads(bridge_socket.sendall.call_args.args[0].decode("utf-8"))
-        self.assertEqual(sent["params"], {"object_id": "c4d:123456789"})
+        self.assertEqual(sent["params"], {"object_id": OBJECT_ID})
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_invalid_object_params_fail_before_connect(self, create_connection):
@@ -133,7 +186,7 @@ class ExternalServerTests(unittest.TestCase):
             {},
             {"object_id": "Cube"},
             {"object_id": "c4d:0"},
-            {"object_id": "c4d:123", "name": "Cube"},
+            {"object_id": OBJECT_ID, "name": "Cube"},
         ):
             with self.subTest(params=params):
                 response = server.send_to_c4d(
@@ -143,6 +196,48 @@ class ExternalServerTests(unittest.TestCase):
                     params=params,
                 )
                 self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "INVALID_PARAMS")
+        create_connection.assert_not_called()
+
+    @patch("cinema4d_mcp.server.socket.create_connection")
+    def test_list_objects_sends_validated_pagination(self, create_connection):
+        bridge_socket = MagicMock()
+        bridge_socket.recv.return_value = (
+            json.dumps(success_response()).encode("utf-8") + b"\n"
+        )
+        create_connection.return_value = bridge_socket
+
+        response = server.send_to_c4d(
+            "list_objects",
+            token=TOKEN,
+            request_id="req-1",
+            params={"offset": 12, "limit": 200},
+        )
+
+        self.assertTrue(response["ok"])
+        sent = json.loads(bridge_socket.sendall.call_args.args[0].decode("utf-8"))
+        self.assertEqual(sent["params"], {"offset": 12, "limit": 200})
+
+    @patch("cinema4d_mcp.server.socket.create_connection")
+    def test_command_specific_params_are_consistently_invalid(self, create_connection):
+        invalid_cases = (
+            ("get_object", {"object_id": "malformed"}),
+            ("list_objects", {"offset": -1}),
+            ("list_objects", {"offset": True}),
+            ("list_objects", {"limit": 0}),
+            ("list_objects", {"limit": False}),
+            ("list_objects", {"limit": 201}),
+            ("list_objects", {"offset": 0, "extra": 1}),
+            ("get_scene_info", {"extra": 1}),
+        )
+        for command, params in invalid_cases:
+            with self.subTest(command=command, params=params):
+                response = server.send_to_c4d(
+                    command,
+                    token=TOKEN,
+                    request_id="req-1",
+                    params=params,
+                )
                 self.assertEqual(response["error"]["code"], "INVALID_PARAMS")
         create_connection.assert_not_called()
 
@@ -184,7 +279,7 @@ class ExternalServerTests(unittest.TestCase):
     def test_capabilities_include_external_server_version(self, create_connection):
         bridge_socket = MagicMock()
         response_payload = success_response()
-        response_payload["result"] = {"bridge_version": "0.2.0-phase1"}
+        response_payload["result"] = {"bridge_version": "0.2.0-phase2a1"}
         bridge_socket.recv.return_value = (
             json.dumps(response_payload).encode("utf-8") + b"\n"
         )
@@ -197,19 +292,31 @@ class ExternalServerTests(unittest.TestCase):
         )
 
         self.assertTrue(response["ok"])
-        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase1")
-        self.assertEqual(response["result"]["mcp_server_version"], "0.2.0-phase1")
+        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase2a1")
+        self.assertEqual(
+            response["result"]["mcp_server_version"],
+            "0.2.0-phase2a1",
+        )
 
     @patch("cinema4d_mcp.server.socket.create_connection")
     def test_legacy_command_is_rejected_without_connecting(self, create_connection):
-        response = server.send_to_c4d(
+        for command in (
+            "create_object",
+            "update_object",
+            "delete_object",
+            "undo_last",
+            "save_document",
             "execute_python",
-            token=TOKEN,
-            request_id="req-1",
-        )
-
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "UNKNOWN_COMMAND")
+            "octane_command",
+        ):
+            with self.subTest(command=command):
+                response = server.send_to_c4d(
+                    command,
+                    token=TOKEN,
+                    request_id="req-1",
+                )
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "UNKNOWN_COMMAND")
         create_connection.assert_not_called()
 
     def test_missing_token_fails_before_connect(self):
