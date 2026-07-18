@@ -13,6 +13,7 @@ import queue
 import socket
 import threading
 import time
+import sys
 
 import c4d
 from c4d import gui
@@ -75,6 +76,78 @@ def _configured_port():
     if not 1 <= port <= 65535:
         raise ValueError("C4D_MCP_PORT must be between 1 and 65535")
     return port
+
+
+def _format_c4d_version(raw_version):
+    """Format the numeric Cinema 4D 2023-style version without hiding raw data."""
+    if not isinstance(raw_version, int) or raw_version < 2000000:
+        return str(raw_version)
+
+    year = raw_version // 1000
+    revision = raw_version % 1000
+    minor = revision // 100
+    patch = (revision % 100) // 10
+    build = revision % 10
+    parts = [str(year), str(minor), str(patch)]
+    if build:
+        parts.append(str(build))
+    return ".".join(parts)
+
+
+def _plugin_label(plugin):
+    """Return non-sensitive plugin registry labels, tolerating incomplete entries."""
+    labels = []
+    try:
+        name = plugin.GetName()
+        if name:
+            labels.append(str(name))
+    except Exception:
+        pass
+    try:
+        filename = plugin.GetFilename()
+        if filename:
+            labels.append(os.path.basename(str(filename)))
+    except Exception:
+        pass
+    return " | ".join(labels)
+
+
+def _detect_octane_on_main_thread():
+    """Detect Octane by the documented C4D plugin registry, never guessed IDs."""
+    try:
+        plugins = c4d.plugins.FilterPluginList(c4d.PLUGINTYPE_ANY, True)
+    except Exception:
+        return {
+            "installed": None,
+            "version": None,
+            "detection": "unverified",
+            "evidence": [],
+        }
+
+    matches = []
+    for plugin in plugins or []:
+        label = _plugin_label(plugin)
+        normalized = label.lower()
+        if "octane" in normalized or "c4doctane" in normalized:
+            matches.append(label)
+
+    if not matches:
+        return {
+            "installed": False,
+            "version": None,
+            "detection": "plugin_registry_not_found",
+            "evidence": [],
+        }
+
+    # C4D's registry proves that an Octane-named plugin is loaded, but it does
+    # not expose a documented Octane release version. Do not parse the C4D
+    # compatibility number from the binary filename as an Octane version.
+    return {
+        "installed": True,
+        "version": None,
+        "detection": "installed_version_unverified",
+        "evidence": sorted(set(matches))[:10],
+    }
 
 
 class _MainThreadTask:
@@ -443,9 +516,24 @@ class C4DSocketServer(threading.Thread):
                 "cinema4d": {"responsive": True},
             }
         if command == "get_capabilities":
+            raw_c4d_version = c4d.GetC4DVersion()
+            c4d_version = _format_c4d_version(raw_c4d_version)
+            python_version = "{}.{}.{}".format(
+                sys.version_info[0],
+                sys.version_info[1],
+                sys.version_info[2],
+            )
             return {
                 "protocol_version": PROTOCOL_VERSION,
                 "bridge_version": BRIDGE_VERSION,
+                "cinema4d": {
+                    "version": c4d_version,
+                    "version_raw": raw_c4d_version,
+                    "python_version": python_version,
+                    "compatibility": (
+                        "target" if c4d_version == "2023.2.2" else "unverified"
+                    ),
+                },
                 "tools": ["ping", "get_capabilities"],
                 "features": {
                     "scene_read": False,
@@ -460,13 +548,13 @@ class C4DSocketServer(threading.Thread):
                     "arbitrary_python": False,
                     "remote_transport": False,
                 },
-                "runtime": {"status": "pending_runtime_probe"},
+                "security": {
+                    "authenticated": True,
+                    "loopback_only": True,
+                    "request_size_limit": self.request_size_limit,
+                },
                 "renderers": {
-                    "octane": {
-                        "installed": None,
-                        "version": None,
-                        "detection": "unverified",
-                    }
+                    "octane": _detect_octane_on_main_thread(),
                 },
             }
         raise ValueError("unsupported Phase 1 command")

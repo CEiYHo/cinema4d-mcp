@@ -43,7 +43,9 @@ def load_plugin_module():
     c4d.plugins = types.SimpleNamespace(
         CommandData=CommandData,
         RegisterCommandPlugin=lambda *args, **kwargs: True,
+        FilterPluginList=lambda *args, **kwargs: [],
     )
+    c4d.PLUGINTYPE_ANY = 0
     c4d.threading = types.SimpleNamespace(GeIsMainThread=lambda: True)
     c4d.GetC4DVersion = lambda: 2023220
     c4d.SpecialEventAdd = lambda *args, **kwargs: None
@@ -179,6 +181,55 @@ class Phase1TransportContractTests(unittest.TestCase):
 
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "AUTH_FAILED")
+
+    def test_capabilities_report_verified_runtime_and_safe_defaults(self):
+        payload = json.dumps(self.request(command="get_capabilities")).encode("utf-8") + b"\n"
+        response = self.exchange(self.make_server(), [payload])
+
+        self.assertTrue(response["ok"])
+        result = response["result"]
+        self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
+        self.assertEqual(result["cinema4d"]["version_raw"], 2023220)
+        self.assertEqual(result["cinema4d"]["compatibility"], "target")
+        self.assertEqual(result["tools"], ["ping", "get_capabilities"])
+        self.assertTrue(all(value is False for value in result["features"].values()))
+        self.assertFalse(result["renderers"]["octane"]["installed"])
+        self.assertIsNone(result["renderers"]["octane"]["version"])
+
+    def test_octane_install_does_not_guess_a_version(self):
+        class OctanePlugin:
+            def GetName(self):
+                return "OctaneRender"
+
+            def GetFilename(self):
+                return r"C:\\plugins\\c4dOctane-R2023.xdl64"
+
+        payload = json.dumps(self.request(command="get_capabilities")).encode("utf-8") + b"\n"
+        with patch.object(
+            self.plugin.c4d.plugins,
+            "FilterPluginList",
+            return_value=[OctanePlugin()],
+        ):
+            response = self.exchange(self.make_server(), [payload])
+
+        octane = response["result"]["renderers"]["octane"]
+        self.assertTrue(octane["installed"])
+        self.assertIsNone(octane["version"])
+        self.assertEqual(octane["detection"], "installed_version_unverified")
+
+    def test_octane_registry_failure_is_unverified_not_false(self):
+        payload = json.dumps(self.request(command="get_capabilities")).encode("utf-8") + b"\n"
+        with patch.object(
+            self.plugin.c4d.plugins,
+            "FilterPluginList",
+            side_effect=RuntimeError("registry unavailable"),
+        ):
+            response = self.exchange(self.make_server(), [payload])
+
+        octane = response["result"]["renderers"]["octane"]
+        self.assertIsNone(octane["installed"])
+        self.assertIsNone(octane["version"])
+        self.assertEqual(octane["detection"], "unverified")
 
 
 if __name__ == "__main__":

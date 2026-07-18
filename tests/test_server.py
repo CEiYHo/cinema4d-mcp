@@ -136,6 +136,26 @@ class ExternalServerTests(unittest.TestCase):
         self.assertEqual(response["error"]["code"], "PROTOCOL_MISMATCH")
 
     @patch("cinema4d_mcp.server.socket.create_connection")
+    def test_capabilities_include_external_server_version(self, create_connection):
+        bridge_socket = MagicMock()
+        response_payload = success_response()
+        response_payload["result"] = {"bridge_version": "0.2.0-phase1"}
+        bridge_socket.recv.return_value = (
+            json.dumps(response_payload).encode("utf-8") + b"\n"
+        )
+        create_connection.return_value = bridge_socket
+
+        response = server.send_to_c4d(
+            "get_capabilities",
+            token=TOKEN,
+            request_id="req-1",
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["bridge_version"], "0.2.0-phase1")
+        self.assertEqual(response["result"]["mcp_server_version"], "0.2.0-phase1")
+
+    @patch("cinema4d_mcp.server.socket.create_connection")
     def test_legacy_command_is_rejected_without_connecting(self, create_connection):
         response = server.send_to_c4d(
             "execute_python",

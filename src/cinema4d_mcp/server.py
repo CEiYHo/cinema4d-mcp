@@ -16,6 +16,7 @@ from .config import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     RESPONSE_TIMEOUT_SECONDS,
+    SERVER_VERSION,
     get_c4d_port,
     get_c4d_token,
 )
@@ -189,7 +190,12 @@ def send_to_c4d(
             )
 
         validation_error = _validate_response(response, request_id)
-        return validation_error or response
+        if validation_error is not None:
+            return validation_error
+        if command == "get_capabilities" and response["ok"]:
+            response["result"] = dict(response["result"])
+            response["result"]["mcp_server_version"] = SERVER_VERSION
+        return response
     except socket.timeout:
         return _error_envelope(
             request_id,
