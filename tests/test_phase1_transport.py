@@ -146,12 +146,13 @@ class Phase1TransportContractTests(unittest.TestCase):
         token=TOKEN,
         request_id="req-1",
         protocol_version=1,
+        params=None,
     ):
         request = {
             "protocol_version": protocol_version,
             "request_id": request_id,
             "command": command,
-            "params": {},
+            "params": {} if params is None else params,
         }
         if token is not OMIT_TOKEN:
             request["token"] = token
@@ -219,7 +220,7 @@ class Phase1TransportContractTests(unittest.TestCase):
         server._dispatch_on_main_thread.assert_not_called()
 
     def test_legacy_command_is_not_dispatchable(self):
-        payload = json.dumps(self.request(command="get_scene_info")).encode("utf-8") + b"\n"
+        payload = json.dumps(self.request(command="create_object")).encode("utf-8") + b"\n"
         response = self.exchange(self.make_server(), [payload])
 
         self.assertFalse(response["ok"])
@@ -292,8 +293,24 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
         self.assertEqual(result["cinema4d"]["version_raw"], 2023202)
         self.assertEqual(result["cinema4d"]["compatibility"], "target")
-        self.assertEqual(result["tools"], ["ping", "get_capabilities"])
-        self.assertTrue(all(value is False for value in result["features"].values()))
+        self.assertEqual(
+            result["tools"],
+            [
+                "ping",
+                "get_capabilities",
+                "get_scene_info",
+                "list_objects",
+                "get_object",
+            ],
+        )
+        self.assertTrue(result["features"]["scene_read"])
+        self.assertTrue(
+            all(
+                value is False
+                for name, value in result["features"].items()
+                if name != "scene_read"
+            )
+        )
         self.assertFalse(result["renderers"]["octane"]["installed"])
         self.assertIsNone(result["renderers"]["octane"]["version"])
 

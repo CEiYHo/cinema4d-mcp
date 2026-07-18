@@ -1,9 +1,9 @@
-"""Secure Phase 1 Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2A Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
-two allowed commands are executed from a custom CoreMessage on Cinema 4D's
-main thread. No scene, object, renderer-control, file, or arbitrary-Python
-command is present in this Phase 1 runtime.
+five allowed commands are executed from a custom CoreMessage on Cinema 4D's
+main thread. Scene and object inspection is read-only; no mutation, renderer
+control, file operation, or arbitrary-Python command is present.
 """
 
 import hmac
@@ -23,7 +23,7 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 1 Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2A Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
@@ -33,7 +33,16 @@ DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
 DEFAULT_CLIENT_TIMEOUT = 5.0
 DEFAULT_MAIN_THREAD_TIMEOUT = 5.0
-ALLOWED_COMMANDS = frozenset(("ping", "get_capabilities"))
+ACTIVE_COMMAND_NAMES = (
+    "ping",
+    "get_capabilities",
+    "get_scene_info",
+    "list_objects",
+    "get_object",
+)
+ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
+OBJECT_ID_PREFIX = "c4d:"
+MAX_OBJECT_ID_LENGTH = 128
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
 TOKEN_MIN_ESTIMATED_ENTROPY_BITS = 128
@@ -79,6 +88,16 @@ def _error_envelope(
             "details": details or {},
         },
     }
+
+
+class _BridgeCommandError(Exception):
+    """Expected structured failure from a validated main-thread command."""
+
+    def __init__(self, code, message, details=None):
+        super(_BridgeCommandError, self).__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
 
 
 def _configured_port():
@@ -134,6 +153,267 @@ def _format_c4d_version(raw_version):
     minor = revision // 100
     patch = revision % 100
     return "{}.{}.{}".format(year, minor, patch)
+
+
+def _is_valid_object_id(value):
+    if not isinstance(value, str) or len(value) > MAX_OBJECT_ID_LENGTH:
+        return False
+    if not value.startswith(OBJECT_ID_PREFIX):
+        return False
+    payload = value[len(OBJECT_ID_PREFIX) :]
+    digits = payload[1:] if payload.startswith("-") else payload
+    return (
+        bool(digits)
+        and digits.isascii()
+        and digits.isdigit()
+        and digits[0] != "0"
+    )
+
+
+def _object_id_or_none(obj):
+    """Serialize documented integer GetGUID() output as an opaque string."""
+    try:
+        guid = obj.GetGUID()
+    except Exception:
+        return None
+    if isinstance(guid, bool) or not isinstance(guid, int) or guid == 0:
+        return None
+    return "{}{}".format(OBJECT_ID_PREFIX, guid)
+
+
+def _walk_document_hierarchy(doc):
+    """Return real document objects in deterministic depth-first pre-order."""
+    entries = []
+    current = doc.GetFirstObject()
+    parent = None
+    depth = 0
+    pending_siblings = []
+
+    while current is not None:
+        entries.append({"object": current, "parent": parent, "depth": depth})
+        sibling = current.GetNext()
+        child = current.GetDown()
+        if sibling is not None:
+            pending_siblings.append((sibling, parent, depth))
+        if child is not None:
+            parent = current
+            current = child
+            depth += 1
+        elif pending_siblings:
+            current, parent, depth = pending_siblings.pop()
+        else:
+            current = None
+    return entries
+
+
+def _build_identity_snapshot(doc):
+    entries = _walk_document_hierarchy(doc)
+    counts = {}
+    for entry in entries:
+        candidate = _object_id_or_none(entry["object"])
+        entry["candidate_id"] = candidate
+        if candidate is not None:
+            counts[candidate] = counts.get(candidate, 0) + 1
+
+    identity_by_object = {}
+    for entry in entries:
+        candidate = entry["candidate_id"]
+        identity_by_object[id(entry["object"])] = (
+            candidate if candidate is not None and counts[candidate] == 1 else None
+        )
+    return entries, identity_by_object
+
+
+def _safe_type_name(obj):
+    try:
+        type_name = obj.GetTypeName()
+    except Exception:
+        return None
+    return type_name if isinstance(type_name, str) and type_name else None
+
+
+def _object_name(obj):
+    name = obj.GetName()
+    if not isinstance(name, str):
+        raise RuntimeError("Cinema 4D returned an invalid object name")
+    return name
+
+
+def _runtime_type_id(obj):
+    type_id = obj.GetType()
+    if isinstance(type_id, bool) or not isinstance(type_id, int):
+        raise RuntimeError("Cinema 4D returned an invalid object type")
+    return type_id
+
+
+def _object_summary(entry, identity_by_object):
+    obj = entry["object"]
+    parent = entry["parent"]
+    object_id = identity_by_object[id(obj)]
+    parent_id = (
+        identity_by_object.get(id(parent)) if parent is not None else None
+    )
+    result = {
+        "object_id": object_id,
+        "addressable": object_id is not None,
+        "name": _object_name(obj),
+        "type_id": _runtime_type_id(obj),
+        "type_name": _safe_type_name(obj),
+        "parent_id": parent_id,
+        "depth": entry["depth"],
+    }
+    if object_id is None:
+        result["id_error"] = "OBJECT_ID_UNAVAILABLE"
+    if parent is not None and parent_id is None:
+        result["parent_id_error"] = "OBJECT_ID_UNAVAILABLE"
+    return result
+
+
+def _require_active_document():
+    doc = c4d.documents.GetActiveDocument()
+    if doc is None:
+        raise _BridgeCommandError(
+            "NO_ACTIVE_DOCUMENT",
+            "Cinema 4D has no active document",
+        )
+    return doc
+
+
+def _read_scene_info(doc):
+    entries, identity_by_object = _build_identity_snapshot(doc)
+    name = doc.GetDocumentName()
+    path = doc.GetDocumentPath()
+    if not isinstance(name, str) or not isinstance(path, str):
+        raise RuntimeError("Cinema 4D returned invalid document metadata")
+
+    active_candidates = set()
+    active_objects = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+    for obj in active_objects or []:
+        candidate = _object_id_or_none(obj)
+        if candidate is not None:
+            active_candidates.add(candidate)
+
+    active_object_ids = []
+    for entry in entries:
+        object_id = identity_by_object[id(entry["object"])]
+        if object_id is not None and object_id in active_candidates:
+            active_object_ids.append(object_id)
+
+    return {
+        "document": {
+            "name": name,
+            "path": path,
+            "saved": bool(path),
+        },
+        "object_count": len(entries),
+        "active_object_ids": active_object_ids,
+    }
+
+
+def _read_object_list(doc):
+    entries, identity_by_object = _build_identity_snapshot(doc)
+    return {
+        "objects": [
+            _object_summary(entry, identity_by_object) for entry in entries
+        ]
+    }
+
+
+def _vector_values(vector):
+    values = [float(vector.x), float(vector.y), float(vector.z)]
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("Cinema 4D returned a non-finite transform")
+    return values
+
+
+def _rotation_degree_values(rotation):
+    # GetRelRot() returns HPB in radians. Vector x/y/z are H/P/B.
+    values = [
+        float(c4d.utils.RadToDeg(rotation.x)),
+        float(c4d.utils.RadToDeg(rotation.y)),
+        float(c4d.utils.RadToDeg(rotation.z)),
+    ]
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("Cinema 4D returned a non-finite rotation")
+    return values
+
+
+def _read_object(doc, object_id):
+    entries, identity_by_object = _build_identity_snapshot(doc)
+    matches = [
+        entry for entry in entries if entry["candidate_id"] == object_id
+    ]
+    if not matches:
+        raise _BridgeCommandError(
+            "OBJECT_NOT_FOUND",
+            "No object with that object_id exists in the active document",
+        )
+    if len(matches) != 1 or identity_by_object[id(matches[0]["object"])] is None:
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNAVAILABLE",
+            "The object_id is not uniquely addressable in the active document",
+        )
+
+    entry = matches[0]
+    obj = entry["object"]
+    parent = entry["parent"]
+    parent_id = (
+        identity_by_object.get(id(parent)) if parent is not None else None
+    )
+    # Reuse the per-request traversal entries so child wrappers do not have to
+    # retain Python object identity across separate Cinema 4D API calls.
+    children = [
+        identity_by_object[id(child_entry["object"])]
+        for child_entry in entries
+        if child_entry["parent"] is obj
+        and identity_by_object[id(child_entry["object"])] is not None
+    ]
+
+    position = obj.GetRelPos()
+    rotation = obj.GetRelRot()
+    scale = obj.GetRelScale()
+    result = {
+        "object_id": object_id,
+        "name": _object_name(obj),
+        "type_id": _runtime_type_id(obj),
+        "type_name": _safe_type_name(obj),
+        "parent_id": parent_id,
+        "transform": {
+            "position": _vector_values(position),
+            "rotation_deg": _rotation_degree_values(rotation),
+            "scale": _vector_values(scale),
+            "space": "relative",
+        },
+        "children": children,
+    }
+    if parent is not None and parent_id is None:
+        result["parent_id_error"] = "OBJECT_ID_UNAVAILABLE"
+    return result
+
+
+def _dispatch_read_command(command, params):
+    try:
+        doc = _require_active_document()
+        if command == "get_scene_info":
+            return _read_scene_info(doc)
+        if command == "list_objects":
+            return _read_object_list(doc)
+        if command == "get_object":
+            object_id = params.get("object_id")
+            if not _is_valid_object_id(object_id):
+                raise _BridgeCommandError(
+                    "INVALID_PARAMS",
+                    "get_object requires one canonical object_id",
+                )
+            return _read_object(doc, object_id)
+    except _BridgeCommandError:
+        raise
+    except Exception:
+        raise _BridgeCommandError(
+            "C4D_API_ERROR",
+            "Cinema 4D could not complete the read-only inspection",
+        )
+    raise _BridgeCommandError("UNKNOWN_COMMAND", "Unsupported read command")
 
 
 def _plugin_label(plugin):
@@ -258,6 +538,14 @@ class _MainThreadTask:
                 self.command, self.params
             )
             self.result = _success_envelope(self.request_id, result)
+        except _BridgeCommandError as exc:
+            self.result = _error_envelope(
+                self.request_id,
+                exc.code,
+                exc.message,
+                retryable=False,
+                details=exc.details,
+            )
         except Exception:
             self.server.log(
                 "Request {} failed inside the main-thread dispatcher".format(
@@ -501,7 +789,7 @@ class C4DSocketServer(threading.Thread):
                         _error_envelope(
                             None,
                             "FRAME_TOO_LARGE",
-                            "Request exceeds the Phase 1 size limit",
+                            "Request exceeds the bridge size limit",
                             retryable=False,
                             details={"max_bytes": self.request_size_limit},
                         ),
@@ -600,7 +888,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 1",
+                        "Command is not available in Phase 2A",
                         retryable=False,
                     ),
                 )
@@ -658,7 +946,7 @@ class C4DSocketServer(threading.Thread):
         if set(request.keys()) != expected_keys:
             return (
                 "INVALID_REQUEST",
-                "Request fields do not match the Phase 1 protocol",
+                "Request fields do not match the bridge protocol",
             )
 
         request_id = request.get("request_id")
@@ -685,10 +973,19 @@ class C4DSocketServer(threading.Thread):
             )
         if not isinstance(request.get("params"), dict):
             return ("INVALID_REQUEST", "params must be an object")
-        if request["params"]:
+        if request.get("command") == "get_object":
+            params = request["params"]
+            if set(params.keys()) != {"object_id"} or not _is_valid_object_id(
+                params.get("object_id")
+            ):
+                return (
+                    "INVALID_PARAMS",
+                    "get_object requires one canonical object_id",
+                )
+        elif request["params"]:
             return (
                 "INVALID_REQUEST",
-                "Phase 1 commands do not accept parameters",
+                "This command does not accept parameters",
             )
         return None
 
@@ -738,7 +1035,7 @@ class C4DSocketServer(threading.Thread):
                 self._active_tasks.discard(task)
 
     def _dispatch_on_main_thread(self, command, params):
-        """The only Phase 1 entry point allowed to call Cinema 4D APIs."""
+        """The only entry point allowed to call Cinema 4D APIs."""
         if hasattr(c4d, "threading") and not c4d.threading.GeIsMainThread():
             raise RuntimeError("dispatcher is not running on the main thread")
 
@@ -768,9 +1065,9 @@ class C4DSocketServer(threading.Thread):
                         "target" if c4d_version == "2023.2.2" else "unverified"
                     ),
                 },
-                "tools": ["ping", "get_capabilities"],
+                "tools": list(ACTIVE_COMMAND_NAMES),
                 "features": {
-                    "scene_read": False,
+                    "scene_read": True,
                     "object_operations": False,
                     "undo": False,
                     "save": False,
@@ -791,7 +1088,9 @@ class C4DSocketServer(threading.Thread):
                     "octane": _detect_octane_on_main_thread(),
                 },
             }
-        raise ValueError("unsupported Phase 1 command")
+        if command in ("get_scene_info", "list_objects", "get_object"):
+            return _dispatch_read_command(command, params)
+        raise ValueError("unsupported Phase 2A command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -810,7 +1109,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 1 Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2A Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
