@@ -219,12 +219,20 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertFalse(delayed_callback())
         server._dispatch_on_main_thread.assert_not_called()
 
-    def test_forbidden_command_is_not_dispatchable(self):
-        payload = json.dumps(self.request(command="save_document")).encode("utf-8") + b"\n"
-        response = self.exchange(self.make_server(), [payload])
+    def test_forbidden_commands_are_not_dispatchable(self):
+        for command in (
+            "undo_last",
+            "save_document",
+            "execute_python",
+            "octane_command",
+            "redshift_command",
+        ):
+            with self.subTest(command=command):
+                payload = json.dumps(self.request(command=command)).encode("utf-8") + b"\n"
+                response = self.exchange(self.make_server(), [payload])
 
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "UNKNOWN_COMMAND")
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "UNKNOWN_COMMAND")
 
     def test_wrong_token_is_rejected(self):
         payload = json.dumps(self.request(token="wrong-token")).encode("utf-8") + b"\n"
@@ -305,17 +313,16 @@ class Phase1TransportContractTests(unittest.TestCase):
                 "create_object",
                 "update_object",
                 "delete_object",
-                "undo_last",
             ],
         )
         self.assertTrue(result["features"]["scene_read"])
         self.assertTrue(result["features"]["object_operations"])
-        self.assertTrue(result["features"]["undo"])
+        self.assertFalse(result["features"]["undo"])
         self.assertTrue(
             all(
                 value is False
                 for name, value in result["features"].items()
-                if name not in ("scene_read", "object_operations", "undo")
+                if name not in ("scene_read", "object_operations")
             )
         )
         self.assertFalse(result["renderers"]["octane"]["installed"])

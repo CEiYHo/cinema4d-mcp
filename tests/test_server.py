@@ -92,7 +92,6 @@ class ExternalServerTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
-            "undo_last",
         )
         self.assertEqual(tuple(decorated_tools), expected)
         self.assertEqual(server.ACTIVE_TOOL_NAMES, expected)

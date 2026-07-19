@@ -149,7 +149,6 @@ def verify_capabilities(response):
         "create_object",
         "update_object",
         "delete_object",
-        "undo_last",
     ]:
         raise SmokeFailure("capability tool list is not the Phase 2B surface")
 

@@ -249,7 +249,6 @@ class Phase2AReadContractTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
-            "undo_last",
         )
         self.assertEqual(self.plugin.ACTIVE_COMMAND_NAMES, expected)
         self.assertEqual(self.plugin.ALLOWED_COMMANDS, frozenset(expected))

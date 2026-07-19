@@ -36,10 +36,9 @@ ACTIVE_TOOL_NAMES = (
     "create_object",
     "update_object",
     "delete_object",
-    "undo_last",
 )
 WRITE_TOOL_NAMES = frozenset(
-    ("create_object", "update_object", "delete_object", "undo_last")
+    ("create_object", "update_object", "delete_object")
 )
 CREATE_OBJECT_TYPES = frozenset(
     ("null", "cube", "sphere", "plane", "cylinder", "cone")
@@ -53,9 +52,6 @@ MAX_OBJECT_ID_LENGTH = (
     + 1
     + OBJECT_SCOPE_HEX_LENGTH
 )
-MUTATION_ID_PREFIX = "mut:"
-MUTATION_SCOPE_HEX_LENGTH = 32
-MAX_MUTATION_ID_LENGTH = len(MUTATION_ID_PREFIX) + MUTATION_SCOPE_HEX_LENGTH
 MAX_OBJECT_NAME_LENGTH = 255
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 200
@@ -71,7 +67,6 @@ MCP_OBJECT_ID = Annotated[
     str,
     Field(pattern=r"^c4d:[0-9a-f]{32}:[0-9a-f]{32}$"),
 ]
-MCP_MUTATION_ID = Annotated[str, Field(pattern=r"^mut:[0-9a-f]{32}$")]
 
 
 class _CommandValidationError(ValueError):
@@ -100,19 +95,6 @@ def _is_valid_object_id(value: Any) -> bool:
     ):
         return False
     return True
-
-
-def _is_valid_mutation_id(value: Any) -> bool:
-    if not isinstance(value, str) or len(value) != MAX_MUTATION_ID_LENGTH:
-        return False
-    if not value.startswith(MUTATION_ID_PREFIX):
-        return False
-    mutation_scope = value[len(MUTATION_ID_PREFIX):]
-    return (
-        len(mutation_scope) == MUTATION_SCOPE_HEX_LENGTH
-        and mutation_scope.isascii()
-        and all(character in "0123456789abcdef" for character in mutation_scope)
-    )
 
 
 def _validated_list_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -210,14 +192,6 @@ def _validated_delete_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return {"object_id": params["object_id"], "recursive": recursive}
 
 
-def _validated_undo_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    if set(params) != {"mutation_id"} or not _is_valid_mutation_id(
-        params.get("mutation_id")
-    ):
-        raise ValueError("undo_last requires one canonical mutation_id")
-    return {"mutation_id": params["mutation_id"]}
-
-
 def _validated_command_params(
     command: str,
     params: Optional[Dict[str, Any]],
@@ -240,8 +214,6 @@ def _validated_command_params(
         return _validated_update_params(params)
     if command == "delete_object":
         return _validated_delete_params(params)
-    if command == "undo_last":
-        return _validated_undo_params(params)
     if command in ACTIVE_TOOL_NAMES:
         if params:
             raise ValueError("This command does not accept parameters")
@@ -571,7 +543,7 @@ async def ping() -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_capabilities() -> Dict[str, Any]:
-    """Report the verified Phase 2B read, typed mutation, and undo surface."""
+    """Report the verified Phase 2B read and typed mutation surface."""
     return await asyncio.to_thread(send_to_c4d, "get_capabilities")
 
 
@@ -656,16 +628,6 @@ async def delete_object(
         send_to_c4d,
         "delete_object",
         params={"object_id": object_id, "recursive": recursive},
-    )
-
-
-@mcp.tool()
-async def undo_last(mutation_id: MCP_MUTATION_ID) -> Dict[str, Any]:
-    """Undo only the verified top MCP mutation for the active document."""
-    return await asyncio.to_thread(
-        send_to_c4d,
-        "undo_last",
-        params={"mutation_id": mutation_id},
     )
 
 

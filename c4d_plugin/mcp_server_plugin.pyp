@@ -1,9 +1,10 @@
 """Secure Phase 2B Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
-nine allowed commands are executed from a custom CoreMessage on Cinema 4D's
-main thread. Mutations are typed, undo-guarded, and never expose arbitrary
-parameters, renderer control, file operations, or Python execution.
+eight allowed commands are executed from a custom CoreMessage on Cinema 4D's
+main thread. Mutations are typed, use native Cinema 4D undo transactions, and
+never expose arbitrary parameters, renderer control, file operations, or
+Python execution.
 """
 
 import hmac
@@ -51,11 +52,10 @@ ACTIVE_COMMAND_NAMES = (
     "create_object",
     "update_object",
     "delete_object",
-    "undo_last",
 )
 ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
 WRITE_COMMAND_NAMES = frozenset(
-    ("create_object", "update_object", "delete_object", "undo_last")
+    ("create_object", "update_object", "delete_object")
 )
 CREATE_OBJECT_TYPES = frozenset(
     ("null", "cube", "sphere", "plane", "cylinder", "cone")
@@ -67,10 +67,6 @@ MAX_OBJECT_ID_LENGTH = (
     + 1
     + OBJECT_SCOPE_HEX_LENGTH
 )
-MUTATION_ID_PREFIX = "mut:"
-MUTATION_SCOPE_BYTES = 16
-MUTATION_SCOPE_HEX_LENGTH = MUTATION_SCOPE_BYTES * 2
-MAX_MUTATION_ID_LENGTH = len(MUTATION_ID_PREFIX) + MUTATION_SCOPE_HEX_LENGTH
 MAX_OBJECT_NAME_LENGTH = 255
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
@@ -144,10 +140,6 @@ class _CommandValidationError(ValueError):
     def __init__(self, code, message):
         super(_CommandValidationError, self).__init__(message)
         self.code = code
-
-
-class _UndoAnchorCaptureError(Exception):
-    """Internal signal for an untrusted current undo transaction anchor."""
 
 
 def _configured_port():
@@ -239,32 +231,6 @@ def _parse_object_id(value):
 
 def _is_valid_object_id(value):
     return _parse_object_id(value) is not None
-
-
-def _parse_mutation_id(value):
-    if not isinstance(value, str) or len(value) != MAX_MUTATION_ID_LENGTH:
-        return None
-    if not value.startswith(MUTATION_ID_PREFIX):
-        return None
-    mutation_scope = value[len(MUTATION_ID_PREFIX):]
-    if (
-        len(mutation_scope) != MUTATION_SCOPE_HEX_LENGTH
-        or not mutation_scope.isascii()
-        or any(character not in "0123456789abcdef" for character in mutation_scope)
-    ):
-        return None
-    return mutation_scope
-
-
-def _is_valid_mutation_id(value):
-    return _parse_mutation_id(value) is not None
-
-
-def _serialize_mutation_id(mutation_scope):
-    value = "{}{}".format(MUTATION_ID_PREFIX, mutation_scope)
-    if _parse_mutation_id(value) != mutation_scope:
-        raise ValueError("invalid mutation scope")
-    return value
 
 
 def _serialize_object_id(document_scope, object_scope):
@@ -461,87 +427,9 @@ class _ObjectScopeRegistry:
 _OBJECT_SCOPES = _ObjectScopeRegistry()
 
 
-class _MutationLedger:
-    """Track MCP-owned undo tops without trusting unrelated Cinema 4D undo work."""
-
-    def __init__(self, token_factory=None):
-        self._token_factory = token_factory or (
-            lambda: secrets.token_hex(MUTATION_SCOPE_BYTES)
-        )
-        self._entries = {}
-        self._by_id = {}
-        self._issued_ids = set()
-
-    def retain_documents(self, document_scopes):
-        for document_scope in list(self._entries):
-            if document_scope not in document_scopes:
-                for entry in self._entries.pop(document_scope):
-                    self._by_id.pop(entry["mutation_id"], None)
-
-    def reserve_id(self):
-        for _ in range(16):
-            try:
-                mutation_scope = self._token_factory()
-                mutation_id = _serialize_mutation_id(mutation_scope)
-            except Exception:
-                continue
-            if mutation_id not in self._issued_ids:
-                self._issued_ids.add(mutation_id)
-                return mutation_id
-        return None
-
-    def record(self, mutation_id, document_scope, undo_anchor, operation_kind):
-        if (
-            mutation_id not in self._issued_ids
-            or mutation_id in self._by_id
-            or undo_anchor is None
-        ):
-            return False
-        entry = {
-            "mutation_id": mutation_id,
-            "document_scope": document_scope,
-            "undo_anchor": undo_anchor,
-            "operation_kind": operation_kind,
-        }
-        self._entries.setdefault(document_scope, []).append(entry)
-        self._by_id[mutation_id] = document_scope
-        return True
-
-    def requested_top(self, document_scope, mutation_id):
-        owner_scope = self._by_id.get(mutation_id)
-        if owner_scope is None:
-            return None, "unavailable"
-        if owner_scope != document_scope:
-            return None, "document_mismatch"
-        entries = self._entries.get(document_scope) or []
-        if not entries:
-            return None, "unavailable"
-        entry = entries[-1]
-        if entry["mutation_id"] != mutation_id:
-            return None, "not_top"
-        return entry, "top"
-
-    def pop_top(self, document_scope, mutation_id):
-        entries = self._entries.get(document_scope) or []
-        if not entries or entries[-1]["mutation_id"] != mutation_id:
-            return False
-        entry = entries.pop()
-        self._by_id.pop(entry["mutation_id"], None)
-        if not entries:
-            self._entries.pop(document_scope, None)
-        return True
-
-    def has_entries(self, document_scope):
-        return bool(self._entries.get(document_scope))
-
-
-_MUTATION_LEDGER = _MutationLedger()
-
-
 def _sync_object_document_buckets():
     document_scopes = _DOCUMENT_SCOPES.live_scopes()
     _OBJECT_SCOPES.retain_documents(document_scopes)
-    _MUTATION_LEDGER.retain_documents(document_scopes)
 
 
 def _walk_document_hierarchy(doc):
@@ -801,14 +689,6 @@ def _validated_delete_params(params):
     return {"object_id": params["object_id"], "recursive": recursive}
 
 
-def _validated_undo_params(params):
-    if set(params) != {"mutation_id"} or not _is_valid_mutation_id(
-        params.get("mutation_id")
-    ):
-        raise ValueError("undo_last requires one canonical mutation_id")
-    return {"mutation_id": params["mutation_id"]}
-
-
 def _validated_command_params(command, params):
     if command == "get_object":
         if set(params.keys()) != {"object_id"} or not _is_valid_object_id(
@@ -824,8 +704,6 @@ def _validated_command_params(command, params):
         return _validated_update_params(params)
     if command == "delete_object":
         return _validated_delete_params(params)
-    if command == "undo_last":
-        return _validated_undo_params(params)
     if command in ALLOWED_COMMANDS:
         if params:
             raise ValueError("This command does not accept parameters")
@@ -1132,80 +1010,6 @@ def _stop_all_threads_or_error(code="MUTATION_FAILED"):
         )
 
 
-def _reserve_mutation_id():
-    mutation_id = _MUTATION_LEDGER.reserve_id()
-    if mutation_id is None:
-        raise _BridgeCommandError(
-            "MUTATION_FAILED",
-            "A mutation identifier could not be allocated",
-        )
-    return mutation_id
-
-
-def _log_undo_anchor_diagnostic(
-    diagnostic_log,
-    undo_anchor,
-    liveness,
-):
-    if diagnostic_log is None:
-        return
-    try:
-        diagnostic_log(
-            "undo_anchor_none={} undo_anchor_type={} "
-            "undo_anchor_liveness={} capture_stage=before_end_undo".format(
-                "true" if undo_anchor is None else "false",
-                type(undo_anchor).__name__,
-                (
-                    "true"
-                    if liveness is True
-                    else "false"
-                    if liveness is False
-                    else "unverified"
-                ),
-            )
-        )
-    except Exception:
-        pass
-
-
-def _capture_current_undo_anchor(doc, diagnostic_log=None):
-    """Capture and verify the current undo anchor before EndUndo()."""
-    try:
-        undo_anchor = doc.GetUndoPtr()
-    except Exception:
-        undo_anchor = None
-    liveness = None if undo_anchor is None else _atom_liveness(undo_anchor)
-    _log_undo_anchor_diagnostic(diagnostic_log, undo_anchor, liveness)
-    if undo_anchor is None or liveness is not True:
-        raise _UndoAnchorCaptureError(
-            "Cinema 4D undo anchor could not be verified before EndUndo"
-        )
-    return undo_anchor
-
-
-def _record_mutation_undo(
-    document_scope,
-    mutation_id,
-    undo_anchor,
-    operation_kind,
-):
-    """Commit a previously verified anchor after EndUndo() succeeds."""
-    try:
-        recorded = _MUTATION_LEDGER.record(
-            mutation_id,
-            document_scope,
-            undo_anchor,
-            operation_kind,
-        )
-    except Exception:
-        recorded = False
-    if not recorded:
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "The scene changed but its MCP undo ledger could not be recorded",
-        )
-
-
 def _prepare_mutation_document(doc):
     try:
         document_scope = _DOCUMENT_SCOPES.scope_for(doc)
@@ -1215,12 +1019,11 @@ def _prepare_mutation_document(doc):
             "MUTATION_FAILED",
             "The active document identity could not be prepared for mutation",
         )
-    mutation_id = _reserve_mutation_id()
-    return document_scope, mutation_id
+    return document_scope
 
 
-def _create_object(doc, params, diagnostic_log=None):
-    document_scope, mutation_id = _prepare_mutation_document(doc)
+def _create_object(doc, params):
+    document_scope = _prepare_mutation_document(doc)
     object_scope = _OBJECT_SCOPES.reserve_scope()
     if object_scope is None:
         raise _BridgeCommandError(
@@ -1261,15 +1064,6 @@ def _create_object(doc, params, diagnostic_log=None):
                 "OUTCOME_UNKNOWN",
                 "The object may have been inserted without a verified undo entry",
             )
-        try:
-            undo_anchor = _capture_current_undo_anchor(doc, diagnostic_log)
-        except _UndoAnchorCaptureError:
-            _best_effort_end_undo(doc)
-            _best_effort_event_add()
-            raise _BridgeCommandError(
-                "OUTCOME_UNKNOWN",
-                "The scene changed but its Cinema 4D undo anchor could not be verified",
-            )
         if doc.EndUndo() is not True:
             _best_effort_event_add()
             raise _BridgeCommandError(
@@ -1292,12 +1086,6 @@ def _create_object(doc, params, diagnostic_log=None):
         )
 
     try:
-        _record_mutation_undo(
-            document_scope,
-            mutation_id,
-            undo_anchor,
-            "create_object",
-        )
         registered = _OBJECT_SCOPES.register_new_object(
             document_scope, object_scope, obj
         )
@@ -1329,16 +1117,14 @@ def _create_object(doc, params, diagnostic_log=None):
             "The object was created but Cinema 4D did not accept the update event",
         )
     return {
-        "mutation_id": mutation_id,
         "object": object_payload,
-        "undo_available": True,
     }
 
 
-def _update_object(doc, params, diagnostic_log=None):
+def _update_object(doc, params):
     resolved = _resolve_object_entry(doc, params["object_id"])
     obj = resolved["entry"]["object"]
-    document_scope, mutation_id = _prepare_mutation_document(doc)
+    document_scope = _prepare_mutation_document(doc)
     if document_scope != resolved["document_scope"]:
         raise _BridgeCommandError(
             "DOCUMENT_ID_UNVERIFIED",
@@ -1371,21 +1157,6 @@ def _update_object(doc, params, diagnostic_log=None):
             "Cinema 4D could not add the update undo entry",
         )
 
-    try:
-        undo_anchor = _capture_current_undo_anchor(doc, diagnostic_log)
-    except _UndoAnchorCaptureError:
-        transaction_closed = _best_effort_end_undo(doc)
-        _best_effort_event_add()
-        if transaction_closed:
-            raise _BridgeCommandError(
-                "MUTATION_FAILED",
-                "The object was not changed because its undo anchor was unavailable",
-            )
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "The object was not changed but its undo transaction did not close",
-        )
-
     mutation_may_have_occurred = True
     try:
         _apply_typed_object_fields(obj, params)
@@ -1407,12 +1178,6 @@ def _update_object(doc, params, diagnostic_log=None):
             )
 
     try:
-        _record_mutation_undo(
-            document_scope,
-            mutation_id,
-            undo_anchor,
-            "update_object",
-        )
         confirmed = _resolve_object_entry(
             doc, params["object_id"]
         )["entry"]["object"]
@@ -1437,13 +1202,11 @@ def _update_object(doc, params, diagnostic_log=None):
             "The object changed but Cinema 4D did not accept the update event",
         )
     return {
-        "mutation_id": mutation_id,
         "object": object_payload,
-        "undo_available": True,
     }
 
 
-def _delete_object(doc, params, diagnostic_log=None):
+def _delete_object(doc, params):
     resolved = _resolve_object_entry(doc, params["object_id"])
     obj = resolved["entry"]["object"]
     if not params["recursive"] and obj.GetDown() is not None:
@@ -1457,7 +1220,7 @@ def _delete_object(doc, params, diagnostic_log=None):
         "type_id": _runtime_type_id(obj),
         "type_name": _safe_type_name(obj),
     }
-    document_scope, mutation_id = _prepare_mutation_document(doc)
+    document_scope = _prepare_mutation_document(doc)
     if document_scope != resolved["document_scope"]:
         raise _BridgeCommandError(
             "DOCUMENT_ID_UNVERIFIED",
@@ -1491,21 +1254,6 @@ def _delete_object(doc, params, diagnostic_log=None):
         )
 
     try:
-        undo_anchor = _capture_current_undo_anchor(doc, diagnostic_log)
-    except _UndoAnchorCaptureError:
-        transaction_closed = _best_effort_end_undo(doc)
-        _best_effort_event_add()
-        if transaction_closed:
-            raise _BridgeCommandError(
-                "MUTATION_FAILED",
-                "The object was not deleted because its undo anchor was unavailable",
-            )
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "The object was not deleted but its undo transaction did not close",
-        )
-
-    try:
         obj.Remove()
         if doc.EndUndo() is not True:
             _best_effort_event_add()
@@ -1523,109 +1271,19 @@ def _delete_object(doc, params, diagnostic_log=None):
             "Cinema 4D may have partially deleted the object",
         )
 
-    try:
-        _record_mutation_undo(
-            document_scope,
-            mutation_id,
-            undo_anchor,
-            "delete_object",
-        )
-    except _BridgeCommandError:
-        _best_effort_event_add()
-        raise
-    except Exception:
-        _best_effort_event_add()
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "The object was deleted but its undo state could not be verified",
-        )
     if not _best_effort_event_add():
         raise _BridgeCommandError(
             "OUTCOME_UNKNOWN",
             "The object was deleted but Cinema 4D did not accept the update event",
         )
     return {
-        "mutation_id": mutation_id,
         "deleted_object_id": params["object_id"],
         "deleted_object": deleted_metadata,
         "recursive": params["recursive"],
-        "undo_available": True,
     }
 
 
-def _undo_last(doc, params):
-    document_scope = _DOCUMENT_SCOPES.scope_for(doc)
-    _sync_object_document_buckets()
-    mutation_id = params["mutation_id"]
-    entry, status = _MUTATION_LEDGER.requested_top(document_scope, mutation_id)
-    if status == "unavailable":
-        raise _BridgeCommandError(
-            "UNDO_NOT_AVAILABLE",
-            "No matching MCP mutation is available for undo",
-        )
-    if status == "document_mismatch":
-        raise _BridgeCommandError(
-            "DOCUMENT_MISMATCH",
-            "The mutation_id belongs to a different document scope",
-        )
-    if status != "top":
-        raise _BridgeCommandError(
-            "UNDO_STATE_MISMATCH",
-            "The requested mutation is not the top MCP mutation",
-        )
-
-    try:
-        current_anchor = doc.GetUndoPtr()
-    except Exception:
-        current_anchor = None
-    stored_anchor = entry["undo_anchor"]
-    if (
-        current_anchor is None
-        or _atom_liveness(current_anchor) is not True
-        or _atom_liveness(stored_anchor) is not True
-        or _same_atom(stored_anchor, current_anchor) is not True
-    ):
-        raise _BridgeCommandError(
-            "UNDO_STATE_MISMATCH",
-            "Cinema 4D undo state no longer matches the MCP mutation",
-        )
-
-    _stop_all_threads_or_error("UNDO_FAILED")
-    try:
-        undo_succeeded = doc.DoUndo()
-    except Exception:
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "Cinema 4D may have partially processed the undo",
-        )
-    if undo_succeeded is not True:
-        raise _BridgeCommandError(
-            "UNDO_FAILED",
-            "Cinema 4D did not complete the undo operation",
-        )
-    try:
-        ledger_advanced = _MUTATION_LEDGER.pop_top(document_scope, mutation_id)
-    except Exception:
-        ledger_advanced = False
-    if not ledger_advanced:
-        _best_effort_event_add()
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "Cinema 4D undid the mutation but the MCP ledger did not advance",
-        )
-    if not _best_effort_event_add():
-        raise _BridgeCommandError(
-            "OUTCOME_UNKNOWN",
-            "Cinema 4D undid the mutation but did not accept the update event",
-        )
-    return {
-        "undone_mutation_id": mutation_id,
-        "operation": entry["operation_kind"],
-        "undo_available": _MUTATION_LEDGER.has_entries(document_scope),
-    }
-
-
-def _dispatch_mutation_command(command, params, diagnostic_log=None):
+def _dispatch_mutation_command(command, params):
     try:
         params = _validated_command_params(command, params)
     except _CommandValidationError as exc:
@@ -1635,13 +1293,11 @@ def _dispatch_mutation_command(command, params, diagnostic_log=None):
 
     doc = _require_active_document()
     if command == "create_object":
-        return _create_object(doc, params, diagnostic_log)
+        return _create_object(doc, params)
     if command == "update_object":
-        return _update_object(doc, params, diagnostic_log)
+        return _update_object(doc, params)
     if command == "delete_object":
-        return _delete_object(doc, params, diagnostic_log)
-    if command == "undo_last":
-        return _undo_last(doc, params)
+        return _delete_object(doc, params)
     raise _BridgeCommandError("UNKNOWN_COMMAND", "Unsupported mutation command")
 
 
@@ -2345,7 +2001,7 @@ class C4DSocketServer(threading.Thread):
                 "features": {
                     "scene_read": True,
                     "object_operations": True,
-                    "undo": True,
+                    "undo": False,
                     "save": False,
                     "animation": False,
                     "camera": False,
@@ -2367,7 +2023,7 @@ class C4DSocketServer(threading.Thread):
         if command in ("get_scene_info", "list_objects", "get_object"):
             return _dispatch_read_command(command, params, request_id)
         if command in WRITE_COMMAND_NAMES:
-            return _dispatch_mutation_command(command, params, self.log)
+            return _dispatch_mutation_command(command, params)
         raise ValueError("unsupported Phase 2B command")
 
 
