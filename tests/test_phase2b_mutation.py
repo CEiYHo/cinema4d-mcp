@@ -130,6 +130,19 @@ class MutationFakeDocument(FakeDocument):
             self.pending_undo = None
         return self.end_undo_result
 
+    def simulate_native_delete_undo(self, replacement=None):
+        if not self.undo_stack or self.undo_stack[-1]["type"] != "DELETE":
+            raise AssertionError("no native delete undo is available")
+        undo_entry = self.undo_stack.pop()
+        snapshot = undo_entry["snapshot"]
+        restored = replacement or undo_entry["object"]
+        parent = snapshot["parent"]
+        siblings = self.roots if parent is None else parent.children
+        siblings.insert(snapshot["index"], restored)
+        self._attach_all()
+        self.log.append("NativeUndoDelete")
+        return restored
+
     def GetUndoPtr(self):
         raise AssertionError("MCP mutation paths must not call GetUndoPtr")
 
@@ -532,16 +545,225 @@ class Phase2BMutationTests(unittest.TestCase):
     def test_delete_leaf_and_scope_non_reuse(self):
         created = self.create()
         deleted_id = created["object"]["object_id"]
+        document_scope, deleted_scope = self.plugin._parse_object_id(deleted_id)
         deleted = self.dispatch(
             "delete_object", {"object_id": deleted_id, "recursive": False}
         )
 
         self.assertEqual(deleted["deleted_object_id"], deleted_id)
         self.assertEqual(self.document.roots, [])
+        self.assertNotIn(
+            deleted_scope,
+            self.plugin._OBJECT_SCOPES._objects.get(document_scope, {}),
+        )
+        self.assertIn(deleted_scope, self.plugin._OBJECT_SCOPES._issued_scopes)
+        self.assertTrue(
+            self.plugin._OBJECT_SCOPES.retire_scopes(
+                document_scope,
+                (deleted_scope,),
+            )
+        )
         stale = self.execute_task("get_object", {"object_id": deleted_id})
-        self.assertEqual(stale["error"]["code"], "OBJECT_NOT_IN_DOCUMENT")
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
         replacement = self.create()
         self.assertNotEqual(replacement["object"]["object_id"], deleted_id)
+
+    def test_native_delete_undo_assigns_a_fresh_id_to_a_different_wrapper(self):
+        created = self.create(name="MCP_E2E_Cube")
+        deleted_id = created["object"]["object_id"]
+        deleted_wrapper = self.document.roots[0]
+
+        self.dispatch(
+            "delete_object", {"object_id": deleted_id, "recursive": False}
+        )
+        deleted_wrapper.liveness_error = True
+        restored_wrapper = MutationFakeObject(
+            0,
+            "MCP_E2E_Cube",
+            10002,
+            "Cube",
+            atom_key=object(),
+        )
+        self.assertIsNot(restored_wrapper, deleted_wrapper)
+        self.assertFalse(restored_wrapper == deleted_wrapper)
+        self.document.simulate_native_delete_undo(restored_wrapper)
+
+        listed = self.dispatch("list_objects")
+        self.assertEqual(listed["returned_count"], 1)
+        restored_summary = listed["objects"][0]
+        restored_id = restored_summary["object_id"]
+        self.assertTrue(restored_summary["addressable"])
+        self.assertIsNotNone(restored_id)
+        self.assertNotEqual(restored_id, deleted_id)
+        self.assertEqual(
+            self.dispatch("get_object", {"object_id": restored_id})["name"],
+            "MCP_E2E_Cube",
+        )
+        stale = self.execute_task("get_object", {"object_id": deleted_id})
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
+
+    def test_native_delete_undo_never_revives_old_id_for_the_same_atom(self):
+        created = self.create(name="RestoredSameAtom")
+        deleted_id = created["object"]["object_id"]
+        deleted_wrapper = self.document.roots[0]
+
+        self.dispatch(
+            "delete_object", {"object_id": deleted_id, "recursive": False}
+        )
+        restored_wrapper = self.document.simulate_native_delete_undo()
+        self.assertIs(restored_wrapper, deleted_wrapper)
+
+        restored_summary = self.dispatch("list_objects")["objects"][0]
+        restored_id = restored_summary["object_id"]
+        self.assertTrue(restored_summary["addressable"])
+        self.assertNotEqual(restored_id, deleted_id)
+        self.assertEqual(
+            self.dispatch("get_object", {"object_id": restored_id})["name"],
+            "RestoredSameAtom",
+        )
+        stale = self.execute_task("get_object", {"object_id": deleted_id})
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
+
+    def test_recursive_delete_retires_subtree_and_restore_gets_fresh_ids(self):
+        cube = MutationFakeObject(0, "Cube", 10002, "Cube")
+        sphere = MutationFakeObject(0, "Sphere", 10003, "Sphere")
+        parent = MutationFakeObject(
+            0,
+            "Null",
+            10001,
+            "Null",
+            children=[cube, sphere],
+        )
+        self.document = MutationFakeDocument([parent])
+        before = self.dispatch("list_objects")["objects"]
+        old_ids = {item["name"]: item["object_id"] for item in before}
+        old_scopes = {
+            self.plugin._parse_object_id(value)[1] for value in old_ids.values()
+        }
+
+        self.dispatch(
+            "delete_object",
+            {"object_id": old_ids["Null"], "recursive": True},
+        )
+
+        bucket = self.plugin._OBJECT_SCOPES._objects.get(SCOPE_A, {})
+        self.assertTrue(old_scopes.isdisjoint(bucket))
+        self.assertTrue(
+            old_scopes.issubset(self.plugin._OBJECT_SCOPES._issued_scopes)
+        )
+        parent.liveness_error = True
+        cube.liveness_error = True
+        sphere.liveness_error = True
+        restored_cube = MutationFakeObject(0, "Cube", 10002, "Cube")
+        restored_sphere = MutationFakeObject(0, "Sphere", 10003, "Sphere")
+        restored_parent = MutationFakeObject(
+            0,
+            "Null",
+            10001,
+            "Null",
+            children=[restored_cube, restored_sphere],
+        )
+        self.document.simulate_native_delete_undo(restored_parent)
+
+        after = self.dispatch("list_objects")["objects"]
+        fresh_ids = {item["name"]: item["object_id"] for item in after}
+        self.assertEqual([item["name"] for item in after], ["Null", "Cube", "Sphere"])
+        for name, old_id in old_ids.items():
+            with self.subTest(name=name):
+                summary = next(item for item in after if item["name"] == name)
+                self.assertTrue(summary["addressable"])
+                self.assertNotEqual(fresh_ids[name], old_id)
+                self.assertEqual(
+                    self.dispatch(
+                        "get_object",
+                        {"object_id": fresh_ids[name]},
+                    )["name"],
+                    name,
+                )
+                stale = self.execute_task("get_object", {"object_id": old_id})
+                self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
+
+    def test_retired_history_does_not_poison_unrelated_object_identity(self):
+        deleted_wrapper = MutationFakeObject(0, "Deleted", 10002, "Cube")
+        unrelated = MutationFakeObject(0, "Unrelated", 10003, "Sphere")
+        self.document = MutationFakeDocument([deleted_wrapper, unrelated])
+        before = self.dispatch("list_objects")["objects"]
+        ids = {item["name"]: item["object_id"] for item in before}
+
+        self.dispatch(
+            "delete_object",
+            {"object_id": ids["Deleted"], "recursive": False},
+        )
+        deleted_wrapper.liveness_error = True
+        restored = MutationFakeObject(0, "Deleted", 10002, "Cube")
+        self.document.simulate_native_delete_undo(restored)
+
+        after = self.dispatch("list_objects")["objects"]
+        summaries = {item["name"]: item for item in after}
+        self.assertTrue(summaries["Deleted"]["addressable"])
+        self.assertTrue(summaries["Unrelated"]["addressable"])
+        self.assertNotEqual(summaries["Deleted"]["object_id"], ids["Deleted"])
+        self.assertEqual(summaries["Unrelated"]["object_id"], ids["Unrelated"])
+
+    def test_delete_retires_before_end_undo_and_failure_clears_bindings(self):
+        created = self.create()
+        deleted_id = created["object"]["object_id"]
+        original_retire = self.plugin._OBJECT_SCOPES.retire_scopes
+
+        def retire_with_log(*args):
+            self.document.log.append("RetireScopes")
+            return original_retire(*args)
+
+        self.document.log.clear()
+        with patch.object(
+            self.plugin._OBJECT_SCOPES,
+            "retire_scopes",
+            side_effect=retire_with_log,
+        ):
+            self.dispatch(
+                "delete_object",
+                {"object_id": deleted_id, "recursive": False},
+            )
+        order = ["Remove", "RetireScopes", "EndUndo"]
+        self.assertEqual(
+            [self.document.log.index(item) for item in order],
+            sorted(self.document.log.index(item) for item in order),
+        )
+
+        self.setUp()
+        created = self.create()
+        deleted_id = created["object"]["object_id"]
+        with patch.object(
+            self.plugin._OBJECT_SCOPES,
+            "retire_scopes",
+            return_value=False,
+        ):
+            response = self.execute_task(
+                "delete_object",
+                {"object_id": deleted_id, "recursive": False},
+            )
+        self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(self.document.roots, [])
+        self.assertNotIn(SCOPE_A, self.plugin._OBJECT_SCOPES._objects)
+        stale = self.execute_task("get_object", {"object_id": deleted_id})
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
+
+    def test_delete_end_undo_failure_still_retires_old_scope(self):
+        created = self.create()
+        deleted_id = created["object"]["object_id"]
+        self.document.end_undo_result = False
+
+        response = self.execute_task(
+            "delete_object",
+            {"object_id": deleted_id, "recursive": False},
+        )
+
+        self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(self.document.roots, [])
+        stale = self.execute_task("get_object", {"object_id": deleted_id})
+        self.assertEqual(stale["error"]["code"], "STALE_OBJECT_ID")
 
     def test_delete_parent_requires_recursive_and_preserves_scene_on_guard(self):
         child = MutationFakeObject(0, "Child", 20002, "Cube")

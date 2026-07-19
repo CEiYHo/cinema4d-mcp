@@ -373,6 +373,38 @@ class _ObjectScopeRegistry:
         bucket[object_scope] = obj
         return True
 
+    def retire_scopes(self, document_scope, object_scopes):
+        """Remove bindings without making their process-local scopes reusable."""
+        if not _is_valid_document_scope(document_scope):
+            return False
+        try:
+            retired_scopes = frozenset(object_scopes)
+        except (TypeError, ValueError):
+            return False
+        if any(not _is_valid_object_scope(scope) for scope in retired_scopes):
+            return False
+
+        bucket = self._objects.get(document_scope)
+        if not bucket:
+            return True
+        remaining = {
+            scope: registered_obj
+            for scope, registered_obj in bucket.items()
+            if scope not in retired_scopes
+        }
+        if remaining:
+            self._objects[document_scope] = remaining
+        else:
+            self._objects.pop(document_scope, None)
+        return True
+
+    def retire_document(self, document_scope):
+        """Fail closed by dropping every binding for one document scope."""
+        if not _is_valid_document_scope(document_scope):
+            return False
+        self._objects.pop(document_scope, None)
+        return True
+
     def scope_for(self, document_scope, obj):
         liveness = _atom_liveness(obj)
         if liveness is False:
@@ -1206,6 +1238,73 @@ def _update_object(doc, params):
     }
 
 
+def _collect_delete_scopes(resolved, recursive):
+    """Collect addressable target/subtree scopes from one resolved DFS snapshot."""
+    entries = resolved["entries"]
+    target_entry = resolved["entry"]
+    target_index = None
+    for index, entry in enumerate(entries):
+        if entry is target_entry:
+            target_index = index
+            break
+    if target_index is None:
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "The delete target was not found in its identity snapshot",
+        )
+
+    selected_entries = [target_entry]
+    if recursive:
+        target_depth = target_entry["depth"]
+        for entry in entries[target_index + 1:]:
+            if entry["depth"] <= target_depth:
+                break
+            selected_entries.append(entry)
+
+    document_scope = resolved["document_scope"]
+    object_scopes = []
+    for entry in selected_entries:
+        object_id = resolved["identity_by_object"].get(id(entry["object"]))
+        if object_id is None:
+            continue
+        parsed = _parse_object_id(object_id)
+        if parsed is None or parsed[0] != document_scope:
+            raise _BridgeCommandError(
+                "OBJECT_ID_UNVERIFIED",
+                "A deleted object scope could not be verified before mutation",
+            )
+        object_scopes.append(parsed[1])
+
+    target_scope = _parse_object_id(
+        resolved["identity_by_object"].get(id(target_entry["object"]))
+    )
+    if (
+        target_scope is None
+        or target_scope[0] != document_scope
+        or target_scope[1] not in object_scopes
+        or len(object_scopes) != len(set(object_scopes))
+    ):
+        raise _BridgeCommandError(
+            "OBJECT_ID_UNVERIFIED",
+            "The delete target scope could not be verified before mutation",
+        )
+    return tuple(object_scopes)
+
+
+def _retire_deleted_scopes(document_scope, object_scopes):
+    """Retire bindings, clearing the document bucket if targeted cleanup fails."""
+    try:
+        if _OBJECT_SCOPES.retire_scopes(document_scope, object_scopes):
+            return True
+    except Exception:
+        pass
+    try:
+        _OBJECT_SCOPES.retire_document(document_scope)
+    except Exception:
+        pass
+    return False
+
+
 def _delete_object(doc, params):
     resolved = _resolve_object_entry(doc, params["object_id"])
     obj = resolved["entry"]["object"]
@@ -1214,6 +1313,10 @@ def _delete_object(doc, params):
             "OBJECT_HAS_CHILDREN",
             "The object has children; set recursive=true to delete its subtree",
         )
+    object_scopes_to_retire = _collect_delete_scopes(
+        resolved,
+        params["recursive"],
+    )
     deleted_metadata = {
         "object_id": params["object_id"],
         "name": _object_name(obj),
@@ -1255,20 +1358,31 @@ def _delete_object(doc, params):
 
     try:
         obj.Remove()
-        if doc.EndUndo() is not True:
-            _best_effort_event_add()
-            raise _BridgeCommandError(
-                "OUTCOME_UNKNOWN",
-                "The object was removed but the undo transaction did not close",
-            )
-    except _BridgeCommandError:
-        raise
     except Exception:
+        _retire_deleted_scopes(document_scope, object_scopes_to_retire)
         _best_effort_end_undo(doc)
         _best_effort_event_add()
         raise _BridgeCommandError(
             "OUTCOME_UNKNOWN",
             "Cinema 4D may have partially deleted the object",
+        )
+
+    if not _retire_deleted_scopes(document_scope, object_scopes_to_retire):
+        _best_effort_end_undo(doc)
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was removed but its previous identity could not be retired",
+        )
+    try:
+        ended = doc.EndUndo()
+    except Exception:
+        ended = False
+    if ended is not True:
+        _best_effort_event_add()
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "The object was removed but the undo transaction did not close",
         )
 
     if not _best_effort_event_add():
