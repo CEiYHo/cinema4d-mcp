@@ -33,13 +33,16 @@ def mutation_id(value):
 
 
 class FakeUndoAnchor:
-    def __init__(self, atom_key=None):
+    def __init__(self, atom_key=None, alive=True, liveness_error=False):
         self.atom_key = atom_key if atom_key is not None else object()
-        self.alive = True
+        self.alive = alive
+        self.liveness_error = liveness_error
         self.equality_error = False
         self.equality_result = DEFAULT_EQUALITY
 
     def IsAlive(self):
+        if self.liveness_error:
+            raise RuntimeError("undo anchor liveness failed")
         return self.alive
 
     def __eq__(self, other):
@@ -101,6 +104,7 @@ class MutationFakeDocument(FakeDocument):
         self.do_undo_result = True
         self.pending_undo = None
         self.undo_stack = []
+        self.undo_anchor_factory = FakeUndoAnchor
         self.manual_undo_anchor = self.NO_MANUAL_ANCHOR
         self._attach_all()
 
@@ -153,7 +157,7 @@ class MutationFakeDocument(FakeDocument):
             "type": undo_type,
             "object": obj,
             "snapshot": snapshot,
-            "anchor": FakeUndoAnchor(),
+            "anchor": self.undo_anchor_factory(),
         }
         return True
 
@@ -168,6 +172,8 @@ class MutationFakeDocument(FakeDocument):
         self.log.append("GetUndoPtr")
         if self.manual_undo_anchor is not self.NO_MANUAL_ANCHOR:
             return self.manual_undo_anchor
+        if self.pending_undo is not None:
+            return self.pending_undo["anchor"]
         return self.undo_stack[-1]["anchor"] if self.undo_stack else None
 
     def DoUndo(self):
@@ -284,6 +290,30 @@ class Phase2BMutationTests(unittest.TestCase):
         request.update(params)
         return self.dispatch("create_object", request)
 
+    def ledger_entry_count(self):
+        return sum(
+            len(entries)
+            for entries in self.plugin._MUTATION_LEDGER._entries.values()
+        )
+
+    def configure_anchor_failure(self, mode):
+        if mode == "none":
+            self.document.GetUndoPtr = MagicMock(return_value=None)
+        elif mode == "exception":
+            self.document.GetUndoPtr = MagicMock(
+                side_effect=RuntimeError("forced GetUndoPtr failure")
+            )
+        elif mode == "dead":
+            self.document.undo_anchor_factory = lambda: FakeUndoAnchor(alive=False)
+        elif mode == "liveness_exception":
+            self.document.undo_anchor_factory = lambda: FakeUndoAnchor(
+                liveness_error=True
+            )
+        elif mode == "liveness_non_bool":
+            self.document.undo_anchor_factory = lambda: FakeUndoAnchor(alive=1)
+        else:
+            self.fail("unknown anchor failure mode: {}".format(mode))
+
     def test_plugin_surface_is_exactly_nine_tools(self):
         expected = (
             "ping",
@@ -322,12 +352,15 @@ class Phase2BMutationTests(unittest.TestCase):
                 self.assertTrue(self.plugin._is_valid_object_id(result["object"]["object_id"]))
                 self.assertTrue(self.plugin._is_valid_mutation_id(result["mutation_id"]))
                 self.assertEqual(created.guid_reads, 0)
-                self.assertEqual(
-                    self.document.log.index("InsertObject")
-                    < self.document.log.index(("AddUndo", "NEW")),
-                    True,
+                create_order = (
+                    "StartUndo",
+                    "InsertObject",
+                    ("AddUndo", "NEW"),
+                    "GetUndoPtr",
+                    "EndUndo",
                 )
-                self.assertEqual(self.document.log[-1], "GetUndoPtr")
+                indexes = [self.document.log.index(item) for item in create_order]
+                self.assertEqual(indexes, sorted(indexes))
 
     def test_create_applies_name_and_relative_hpb_psr(self):
         result = self.create(
@@ -430,8 +463,13 @@ class Phase2BMutationTests(unittest.TestCase):
         self.assertEqual(updated["object"]["name"], "Updated")
         self.assertEqual(self.document.log.count(("AddUndo", "CHANGE")), 1)
         add_index = self.document.log.index(("AddUndo", "CHANGE"))
+        anchor_index = self.document.log.index("GetUndoPtr")
+        end_index = self.document.log.index("EndUndo")
+        self.assertLess(add_index, anchor_index)
         for setter in ("SetName", "SetRelPos", "SetRelRot", "SetRelScale"):
-            self.assertGreater(self.document.log.index(setter), add_index)
+            setter_index = self.document.log.index(setter)
+            self.assertGreater(setter_index, anchor_index)
+            self.assertLess(setter_index, end_index)
 
     def test_update_cross_document_and_detached_objects_fail_closed(self):
         created = self.create()
@@ -552,6 +590,168 @@ class Phase2BMutationTests(unittest.TestCase):
         self.assertNotIn("InsertObject", self.document.log)
         self.assertFalse(any(entry == ("AddUndo", "NEW") for entry in self.document.log))
 
+    def test_anchor_failures_are_fail_closed_for_each_mutation(self):
+        failure_modes = (
+            "none",
+            "exception",
+            "dead",
+            "liveness_exception",
+            "liveness_non_bool",
+        )
+        for operation in ("create", "update", "delete"):
+            for mode in failure_modes:
+                with self.subTest(operation=operation, mode=mode):
+                    self.setUp()
+                    params = {"type": "cube"}
+                    expected_error = "OUTCOME_UNKNOWN"
+                    if operation != "create":
+                        created = self.create(name="Before")
+                        params = {"object_id": created["object"]["object_id"]}
+                        if operation == "update":
+                            params["name"] = "After"
+                        else:
+                            params["recursive"] = False
+                        expected_error = "MUTATION_FAILED"
+                    ledger_count = self.ledger_entry_count()
+                    self.document.log.clear()
+                    self.configure_anchor_failure(mode)
+
+                    response = self.execute_task(
+                        "{}_object".format(operation),
+                        params,
+                    )
+
+                    self.assertEqual(response["error"]["code"], expected_error)
+                    self.assertFalse(response["error"]["retryable"])
+                    self.assertEqual(self.ledger_entry_count(), ledger_count)
+                    self.assertEqual(len(self.document.roots), 1)
+                    self.assertIn("EndUndo", self.document.log)
+                    if operation == "update":
+                        self.assertEqual(self.document.roots[0].name, "Before")
+                        self.assertNotIn("SetName", self.document.log)
+                    if operation == "delete":
+                        self.assertNotIn("Remove", self.document.log)
+
+    def test_anchor_failure_with_failed_cleanup_is_outcome_unknown(self):
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                self.setUp()
+                created = self.create(name="Before")
+                params = {"object_id": created["object"]["object_id"]}
+                if operation == "update":
+                    params["name"] = "After"
+                else:
+                    params["recursive"] = False
+                ledger_count = self.ledger_entry_count()
+                self.document.end_undo_result = False
+                self.configure_anchor_failure("none")
+
+                response = self.execute_task(
+                    "{}_object".format(operation),
+                    params,
+                )
+
+                self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+                self.assertFalse(response["error"]["retryable"])
+                self.assertEqual(self.ledger_entry_count(), ledger_count)
+                self.assertEqual(len(self.document.roots), 1)
+                self.assertEqual(self.document.roots[0].name, "Before")
+
+    def test_anchor_diagnostics_contain_only_safe_capture_state(self):
+        obj = MutationFakeObject(0, "Diagnostic", 10002, "Cube")
+        logs = []
+        self.document.StartUndo()
+        self.document.InsertObject(obj)
+        self.document.AddUndo("NEW", obj)
+
+        anchor = self.plugin._capture_current_undo_anchor(
+            self.document,
+            logs.append,
+        )
+
+        self.assertIs(anchor, self.document.pending_undo["anchor"])
+        self.assertEqual(
+            logs,
+            [
+                "undo_anchor_none=false undo_anchor_type=FakeUndoAnchor "
+                "undo_anchor_liveness=true capture_stage=before_end_undo"
+            ],
+        )
+
+        self.document.GetUndoPtr = MagicMock(return_value=None)
+        with self.assertRaises(self.plugin._UndoAnchorCaptureError):
+            self.plugin._capture_current_undo_anchor(
+                self.document,
+                logs.append,
+            )
+        self.assertEqual(
+            logs[-1],
+            "undo_anchor_none=true undo_anchor_type=NoneType "
+            "undo_anchor_liveness=unverified capture_stage=before_end_undo",
+        )
+
+    def test_ledger_record_occurs_only_after_successful_end_undo(self):
+        for operation in ("create", "update", "delete"):
+            with self.subTest(operation=operation):
+                self.setUp()
+                params = {"type": "cube"}
+                if operation != "create":
+                    created = self.create(name="Before")
+                    params = {"object_id": created["object"]["object_id"]}
+                    if operation == "update":
+                        params["name"] = "After"
+                    else:
+                        params["recursive"] = False
+                self.document.log.clear()
+                original_record = self.plugin._MUTATION_LEDGER.record
+
+                def recording_ledger(*args):
+                    self.document.log.append("LedgerRecord")
+                    return original_record(*args)
+
+                with patch.object(
+                    self.plugin._MUTATION_LEDGER,
+                    "record",
+                    side_effect=recording_ledger,
+                ):
+                    self.dispatch("{}_object".format(operation), params)
+
+                anchor_index = self.document.log.index("GetUndoPtr")
+                end_index = self.document.log.index("EndUndo")
+                record_index = self.document.log.index("LedgerRecord")
+                self.assertLess(anchor_index, end_index)
+                self.assertLess(end_index, record_index)
+
+    def test_failed_end_undo_never_records_mutation_ledger_entry(self):
+        for operation in ("create", "update", "delete"):
+            with self.subTest(operation=operation):
+                self.setUp()
+                params = {"type": "cube"}
+                if operation != "create":
+                    created = self.create(name="Before")
+                    params = {"object_id": created["object"]["object_id"]}
+                    if operation == "update":
+                        params["name"] = "After"
+                    else:
+                        params["recursive"] = False
+                ledger_count = self.ledger_entry_count()
+                self.document.end_undo_result = False
+
+                with patch.object(
+                    self.plugin._MUTATION_LEDGER,
+                    "record",
+                    wraps=self.plugin._MUTATION_LEDGER.record,
+                ) as record:
+                    response = self.execute_task(
+                        "{}_object".format(operation),
+                        params,
+                    )
+
+                self.assertEqual(response["error"]["code"], "OUTCOME_UNKNOWN")
+                self.assertFalse(response["error"]["retryable"])
+                record.assert_not_called()
+                self.assertEqual(self.ledger_entry_count(), ledger_count)
+
     def test_partial_update_and_end_undo_failure_are_outcome_unknown(self):
         created = self.create(name="Before")
         object_id_value = created["object"]["object_id"]
@@ -614,10 +814,15 @@ class Phase2BMutationTests(unittest.TestCase):
         )
         self.assertTrue(deleted["recursive"])
         self.assertEqual(self.document.roots, [])
-        self.assertLess(
-            self.document.log.index(("AddUndo", "DELETE")),
-            self.document.log.index("Remove"),
+        delete_order = (
+            "StartUndo",
+            ("AddUndo", "DELETE"),
+            "GetUndoPtr",
+            "Remove",
+            "EndUndo",
         )
+        indexes = [self.document.log.index(item) for item in delete_order]
+        self.assertEqual(indexes, sorted(indexes))
 
     def test_delete_add_undo_failure_does_not_remove_object(self):
         created = self.create()
