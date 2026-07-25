@@ -966,7 +966,11 @@ class Phase2BExternalTransportTests(unittest.TestCase):
                     response = asyncio.run(
                         external_server.mcp.call_tool(name, arguments)
                     )
-                    self.assertEqual(response["error"]["code"], code)
+                    self.assertIs(response.isError, True)
+                    self.assertEqual(
+                        response.structuredContent["result"]["error"]["code"],
+                        code,
+                    )
         connect.assert_not_called()
 
     def _write_transport_failure(self, recv_effect):

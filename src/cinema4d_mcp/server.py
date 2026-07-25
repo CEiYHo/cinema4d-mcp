@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
+import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field, StrictBool, StrictFloat, StrictInt
 
@@ -247,6 +248,28 @@ def _error_envelope(
     }
 
 
+def _mcp_validation_error_result(
+    request_id: str,
+    code: str,
+    message: str,
+) -> mcp_types.CallToolResult:
+    """Return an error result compatible with FastMCP 1.28.1 STDIO output."""
+    envelope = _error_envelope(request_id, code, message)
+    return mcp_types.CallToolResult(
+        isError=True,
+        content=[
+            mcp_types.TextContent(
+                type="text",
+                text=f"{code}: {message}",
+            )
+        ],
+        # Dict return annotations are wrapped by FastMCP 1.28.1 under "result".
+        # Keep error structured content compatible with the advertised schema
+        # even though MCP clients skip output validation when isError is true.
+        structuredContent={"result": envelope},
+    )
+
+
 def _validate_response(response: Any, request_id: str) -> Optional[Dict[str, Any]]:
     if not isinstance(response, dict):
         return _error_envelope(
@@ -298,6 +321,32 @@ def _validate_response(response: Any, request_id: str) -> Optional[Dict[str, Any
 class Cinema4DFastMCP(FastMCP):
     """Validate raw tool arguments before FastMCP/Pydantic can coerce them."""
 
+    def _setup_handlers(self) -> None:
+        """Preserve explicit-null arguments before FastMCP normalizes them."""
+        super()._setup_handlers()
+        original_handler = self._mcp_server.request_handlers[
+            mcp_types.CallToolRequest
+        ]
+
+        async def strict_call_tool_handler(request: mcp_types.CallToolRequest):
+            if (
+                request.params.name == "save_document"
+                and request.params.arguments is None
+            ):
+                request_id = uuid.uuid4().hex
+                return mcp_types.ServerResult(
+                    _mcp_validation_error_result(
+                        request_id,
+                        "INVALID_PARAMS",
+                        "Tool arguments must be an object",
+                    )
+                )
+            return await original_handler(request)
+
+        self._mcp_server.request_handlers[
+            mcp_types.CallToolRequest
+        ] = strict_call_tool_handler
+
     async def call_tool(
         self,
         name: str,
@@ -306,7 +355,7 @@ class Cinema4DFastMCP(FastMCP):
         if name in ACTIVE_TOOL_NAMES:
             request_id = uuid.uuid4().hex
             if not isinstance(arguments, dict):
-                return _error_envelope(
+                return _mcp_validation_error_result(
                     request_id,
                     "INVALID_PARAMS",
                     "Tool arguments must be an object",
@@ -314,9 +363,17 @@ class Cinema4DFastMCP(FastMCP):
             try:
                 _validated_command_params(name, arguments)
             except _CommandValidationError as exc:
-                return _error_envelope(request_id, exc.code, str(exc))
+                return _mcp_validation_error_result(
+                    request_id,
+                    exc.code,
+                    str(exc),
+                )
             except ValueError as exc:
-                return _error_envelope(request_id, "INVALID_PARAMS", str(exc))
+                return _mcp_validation_error_result(
+                    request_id,
+                    "INVALID_PARAMS",
+                    str(exc),
+                )
         return await super().call_tool(name, arguments)
 
 

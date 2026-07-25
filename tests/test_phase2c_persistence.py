@@ -8,12 +8,17 @@ import math
 import os
 import queue
 import socket
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import anyio
+from jsonschema import validate as validate_json_schema
+from mcp import ClientSession, StdioServerParameters, stdio_client
 
 from cinema4d_mcp import server as external_server
 from cinema4d_mcp.config import (
@@ -483,8 +488,9 @@ class Phase2CExternalTransportTests(unittest.TestCase):
             null_response = asyncio.run(
                 external_server.mcp.call_tool("save_document", None)
             )
+            self.assertIs(null_response.isError, True)
             self.assertEqual(
-                null_response["error"]["code"],
+                null_response.structuredContent["result"]["error"]["code"],
                 "INVALID_PARAMS",
             )
             for arguments in invalid_arguments:
@@ -505,8 +511,11 @@ class Phase2CExternalTransportTests(unittest.TestCase):
                             arguments,
                         )
                     )
+                    self.assertIs(tool_response.isError, True)
                     self.assertEqual(
-                        tool_response["error"]["code"],
+                        tool_response.structuredContent["result"]["error"][
+                            "code"
+                        ],
                         "INVALID_PARAMS",
                     )
         connect.assert_not_called()
@@ -599,6 +608,138 @@ class Phase2CExternalTransportTests(unittest.TestCase):
         )
         self.assertEqual(response["error"]["code"], "C4D_TIMEOUT")
         self.assertTrue(response["error"]["retryable"])
+
+
+class Phase2CStdioIntegrationTests(unittest.TestCase):
+    def test_real_stdio_validation_errors_are_transport_safe(self):
+        async def exercise_stdio():
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                temporary_path = Path(temporary_directory)
+                send_log = temporary_path / "send.jsonl"
+                socket_log = temporary_path / "socket.jsonl"
+                stderr_log = temporary_path / "stderr.log"
+                environment = dict(os.environ)
+                environment["PYTHONPATH"] = os.path.abspath("src")
+                environment["PHASE2C_STDIO_SEND_LOG"] = str(send_log)
+                environment["PHASE2C_STDIO_SOCKET_LOG"] = str(socket_log)
+                parameters = StdioServerParameters(
+                    command=sys.executable,
+                    args=["-m", "tests.phase2c_stdio_fixture"],
+                    cwd=os.getcwd(),
+                    env=environment,
+                )
+
+                with stderr_log.open("w+", encoding="utf-8") as error_stream:
+                    async with stdio_client(
+                        parameters,
+                        errlog=error_stream,
+                    ) as streams:
+                        async with ClientSession(*streams) as session:
+                            await session.initialize()
+                            listed = await session.list_tools()
+                            tools_by_name = {
+                                tool.name: tool for tool in listed.tools
+                            }
+                            self.assertEqual(
+                                list(tools_by_name),
+                                list(external_server.ACTIVE_TOOL_NAMES),
+                            )
+                            save_tool = tools_by_name["save_document"]
+                            self.assertEqual(
+                                save_tool.inputSchema.get("properties", {}),
+                                {},
+                            )
+                            self.assertNotIn(
+                                "additionalProperties",
+                                save_tool.inputSchema,
+                            )
+
+                            invalid_calls = (
+                                ("save_document", None),
+                                (
+                                    "save_document",
+                                    {"path": r"C:\temp\other.c4d"},
+                                ),
+                                (
+                                    "save_document",
+                                    {"filename": "other.c4d"},
+                                ),
+                                ("save_document", {"save_as": True}),
+                                ("save_document", {"overwrite": True}),
+                                ("save_document", {"format": "c4d"}),
+                                ("get_scene_info", {"extra": True}),
+                                ("ping", {"extra": True}),
+                                ("get_object", {"object_id": "malformed"}),
+                            )
+                            for tool_name, arguments in invalid_calls:
+                                with self.subTest(
+                                    tool_name=tool_name,
+                                    arguments=arguments,
+                                ):
+                                    result = await session.call_tool(
+                                        tool_name,
+                                        arguments,
+                                    )
+                                    self.assertIs(result.isError, True)
+                                    self.assertIsInstance(
+                                        result.structuredContent,
+                                        dict,
+                                    )
+                                    validate_json_schema(
+                                        result.structuredContent,
+                                        tools_by_name[tool_name].outputSchema,
+                                    )
+                                    error_envelope = (
+                                        result.structuredContent["result"]
+                                    )
+                                    self.assertEqual(
+                                        error_envelope["error"]["code"],
+                                        "INVALID_PARAMS",
+                                    )
+                                    text = "\n".join(
+                                        content.text
+                                        for content in result.content
+                                        if getattr(content, "type", None)
+                                        == "text"
+                                    )
+                                    self.assertIn("INVALID_PARAMS", text)
+                                    self.assertNotIn(
+                                        "Output validation error",
+                                        text,
+                                    )
+
+                            self.assertFalse(send_log.exists())
+                            self.assertFalse(socket_log.exists())
+
+                            normal = await session.call_tool(
+                                "save_document",
+                                {},
+                            )
+                            self.assertIs(normal.isError, False)
+                            self.assertEqual(
+                                normal.structuredContent["result"]["result"][
+                                    "saved"
+                                ],
+                                True,
+                            )
+
+                send_records = [
+                    json.loads(line)
+                    for line in send_log.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(
+                    send_records,
+                    [{"command": "save_document", "params": {}}],
+                )
+                self.assertFalse(socket_log.exists())
+                self.assertNotIn(
+                    "Output validation error",
+                    stderr_log.read_text(encoding="utf-8"),
+                )
+
+        anyio.run(exercise_stdio)
 
 
 if __name__ == "__main__":

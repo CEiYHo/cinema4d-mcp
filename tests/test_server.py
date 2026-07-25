@@ -121,7 +121,11 @@ class ExternalServerTests(unittest.TestCase):
             for name, arguments in invalid_calls:
                 with self.subTest(name=name, arguments=arguments):
                     response = asyncio.run(server.mcp.call_tool(name, arguments))
-                    self.assertEqual(response["error"]["code"], "INVALID_PARAMS")
+                    self.assertIs(response.isError, True)
+                    self.assertEqual(
+                        response.structuredContent["result"]["error"]["code"],
+                        "INVALID_PARAMS",
+                    )
 
         connect.assert_not_called()
 
