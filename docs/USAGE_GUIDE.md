@@ -1,5 +1,14 @@
 # Cinema 4D MCP Usage Guide
 
+> **Legacy upstream guide:** This document describes an earlier, uncertified
+> tool surface and is retained only as historical upstream material. Commands
+> such as `execute_python_script`, MoGraph operations, Redshift operations, and
+> raw socket fallback are not available in certified runtime
+> `0.4.0-phase2c`. Do not use this guide as an operational or security
+> reference. The current source of truth is
+> [Phase 2 Final Certification](PHASE2_FINAL_CERTIFICATION.md), whose external
+> surface contains exactly nine allowlisted tools.
+
 Practical guide for working with Cinema 4D through the MCP server, based on real-world production experience.
 
 ## Table of Contents
