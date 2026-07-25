@@ -2,6 +2,22 @@
 
 Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D manipulation.
 
+## Certified Phase 2 status
+
+Phase 2 is FINAL COMPLETE for the certified Windows environment using Cinema
+4D 2023.2.2, Cinema 4D Python 3.10.8, MCP Python package 1.28.1, and runtime
+`0.4.0-phase2c`.
+
+The certified surface contains exactly nine tools: `ping`, `get_capabilities`,
+`get_scene_info`, `list_objects`, `get_object`, `create_object`,
+`update_object`, `delete_object`, and `save_document`. Saving is restricted to
+the active document's existing native `.c4d` path. Remote MCP undo, Save As,
+arbitrary Python, renderer control, and remote transport are unavailable.
+
+See [Phase 2 Final Certification](docs/PHASE2_FINAL_CERTIFICATION.md) for the
+certified architecture, security boundaries, evidence, and maintenance
+requirements.
+
 ## Table of Contents
 
 - [Components](#components)
@@ -23,8 +39,9 @@ Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D ma
 
 ## Prerequisites
 
-- Cinema 4D (R2024+ recommended)
-- Python 3.10 or higher (for the MCP Server component)
+- Cinema 4D 2023.2.2 (certified target)
+- Python 3.10 (Cinema 4D 3.10.8 and MCP server 3.10 are certified)
+- MCP Python package 1.28.1
 
 ## Installation
 
@@ -111,6 +128,10 @@ To configure Claude Desktop, you need to modify its configuration file:
 
 ## Agent Skill
 
+> The companion skill described below is not part of the certified Phase 2
+> surface. Guidance involving arbitrary Python, Redshift, or MoGraph does not
+> apply to runtime `0.4.0-phase2c`.
+
 If you use agent skills, the maintained companion skill for this MCP lives in [vladmdgolam/agent-skills](https://github.com/vladmdgolam/agent-skills/tree/main/skills/cinema4d-mcp).
 
 The skill captures production-oriented guidance that sits on top of the raw MCP tools, including:
@@ -133,6 +154,11 @@ python main.py
 You should see output confirming the server's successful start and connection to Cinema 4D.
 
 ### Testing with MCP Test Harness
+
+> `tests/mcp_test_harness_gui.py` and `tests/mcp_test_harness.jsonl` are legacy
+> upstream artifacts and are not Phase 2 certification harnesses. Use the
+> automated `unittest` suite and the procedures recorded in
+> [Phase 2 Final Certification](docs/PHASE2_FINAL_CERTIFICATION.md).
 
 The repository includes a simple test harness for running predefined command sequences:
 
@@ -212,7 +238,24 @@ cinema4d-mcp/
 
 ## Tool Commands
 
-### General Scene & Execution
+The certified runtime exposes only:
+
+- `ping`
+- `get_capabilities`
+- `get_scene_info`
+- `list_objects`
+- `get_object`
+- `create_object`
+- `update_object`
+- `delete_object`
+- `save_document`
+
+`save_document` takes no arguments and saves only the active document to its
+already existing native `.c4d` file. The older command catalogue below is
+retained as upstream history; those commands are not exposed by runtime
+`0.4.0-phase2c`.
+
+### Legacy upstream command catalogue (unavailable)
 
 - `get_scene_info`: Get summary info about the active Cinema 4D scene. ✅
 - `list_objects`: List all scene objects (with hierarchy). ✅
@@ -263,7 +306,16 @@ cinema4d-mcp/
 - `render_preview`: Render a quick preview and return base64 image (for AI). ✅
 - `snapshot_scene`: Capture a snapshot of the scene (objects + preview image). ✅
 
-## Compatibility Plan & Roadmap
+## Certified compatibility
+
+| Cinema 4D | Cinema 4D Python | MCP package | Status |
+| --- | --- | --- | --- |
+| 2023.2.2 | 3.10.8 | 1.28.1 | Phase 2 FINAL COMPLETE |
+
+Other Cinema 4D, Python, and MCP SDK versions are not covered by this
+certification and require renewed applicable testing.
+
+## Legacy Compatibility Plan & Roadmap (uncertified)
 
 | Cinema 4D Version | Python Version | Compatibility Status | Notes                                             |
 | ----------------- | -------------- | -------------------- | ------------------------------------------------- |
@@ -281,7 +333,7 @@ cinema4d-mcp/
 - **Mid Term**: Add conditional handling for missing MoGraph and Field APIs
 - **Long Term**: Consider optional legacy plugin module for R23–S26 support if demand arises
 
-## Recent Fixes
+## Legacy upstream change notes (uncertified)
 
 - Context Awareness: Implemented robust object tracking using GUIDs. Commands creating objects return context (guid, actual_name, etc.). Subsequent commands correctly use GUIDs passed by the test harness/server to find objects reliably.
 - Object Finding: Reworked find_object_by_name to correctly handle GUIDs (numeric string format), fixed recursion errors, and improved reliability when doc.SearchObject fails.

@@ -1,13 +1,15 @@
-"""Cinema 4D MCP Server - Connect Claude to Cinema 4D"""
+"""Secure Phase 2C MCP connectivity for Cinema 4D."""
 
-__version__ = "0.1.0"
+__version__ = "0.4.0-phase2c"
 
-from . import server
+from .startup import run_mcp_runtime
+
 
 def main():
-    """Main entry point for the package."""
-    server.mcp_app.run()
+    """Validated entry point for the package console script."""
+    return run_mcp_runtime()
+
 
 def main_wrapper():
-    """Entry point for the wrapper script."""
-    main()
+    """Validated entry point for the compatibility wrapper script."""
+    return run_mcp_runtime()
