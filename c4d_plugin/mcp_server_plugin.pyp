@@ -1,10 +1,10 @@
-"""Secure Phase 2B Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
+"""Secure Phase 2C Cinema 4D MCP bridge for Cinema 4D 2023.2.2.
 
 The socket thread performs transport validation and authentication only. The
-eight allowed commands are executed from a custom CoreMessage on Cinema 4D's
+nine allowed commands are executed from a custom CoreMessage on Cinema 4D's
 main thread. Mutations are typed, use native Cinema 4D undo transactions, and
-never expose arbitrary parameters, renderer control, file operations, or
-Python execution.
+document persistence is limited to the active document's existing native C4D
+file. Arbitrary paths, renderer control, and Python execution remain unavailable.
 """
 
 import hmac
@@ -26,16 +26,17 @@ from c4d import gui
 # Retained from the upstream baseline so the existing plugin registration keeps
 # working. Replace this only with an ID whose Plugin Café ownership is verified.
 PLUGIN_ID = 1057843
-PLUGIN_NAME = "Cinema 4D MCP Phase 2B Bridge"
+PLUGIN_NAME = "Cinema 4D MCP Phase 2C Bridge"
 MAIN_THREAD_EVENT_ID = PLUGIN_ID
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.3.0-phase2b"
+BRIDGE_VERSION = "0.4.0-phase2c"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_REQUEST_SIZE_LIMIT = 64 * 1024
 DEFAULT_CLIENT_TIMEOUT = 5.0
 DEFAULT_MAIN_THREAD_TIMEOUT = 5.0
+DEFAULT_SAVE_COMPLETION_TIMEOUT = 120.0
 MAX_RESPONSE_FRAME_BYTES = 64 * 1024
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 200
@@ -52,10 +53,11 @@ ACTIVE_COMMAND_NAMES = (
     "create_object",
     "update_object",
     "delete_object",
+    "save_document",
 )
 ALLOWED_COMMANDS = frozenset(ACTIVE_COMMAND_NAMES)
 WRITE_COMMAND_NAMES = frozenset(
-    ("create_object", "update_object", "delete_object")
+    ("create_object", "update_object", "delete_object", "save_document")
 )
 CREATE_OBJECT_TYPES = frozenset(
     ("null", "cube", "sphere", "plane", "cylinder", "cone")
@@ -1397,6 +1399,134 @@ def _delete_object(doc, params):
     }
 
 
+def _existing_document_save_target(doc):
+    try:
+        document_path = doc.GetDocumentPath()
+        document_name = doc.GetDocumentName()
+    except Exception:
+        raise _BridgeCommandError(
+            "C4D_API_ERROR",
+            "Cinema 4D could not read the active document save target",
+        )
+
+    if not isinstance(document_path, str) or not isinstance(document_name, str):
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "Cinema 4D returned invalid document save metadata",
+        )
+    if not document_path or not document_name:
+        raise _BridgeCommandError(
+            "SAVE_PATH_REQUIRED",
+            "Save the document manually in Cinema 4D before using save_document",
+        )
+    if "\x00" in document_path or "\x00" in document_name:
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document save target is invalid",
+        )
+    if not os.path.isabs(document_path):
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document path is not absolute",
+        )
+    if (
+        document_name in (".", "..")
+        or os.path.basename(document_name) != document_name
+        or "/" in document_name
+        or "\\" in document_name
+    ):
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document name must be a filename without a path",
+        )
+    if os.path.splitext(document_name)[1].lower() != ".c4d":
+        raise _BridgeCommandError(
+            "SAVE_FORMAT_UNSUPPORTED",
+            "save_document supports only an existing native .c4d document",
+        )
+
+    try:
+        normalized_path = os.path.abspath(os.path.normpath(document_path))
+        full_path = os.path.abspath(
+            os.path.normpath(os.path.join(normalized_path, document_name))
+        )
+        real_directory = os.path.realpath(normalized_path)
+        real_target = os.path.realpath(full_path)
+        if os.path.commonpath((real_directory, real_target)) != real_directory:
+            raise ValueError("save target escapes document directory")
+    except (OSError, TypeError, ValueError):
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document save target is invalid",
+        )
+
+    try:
+        target_exists = os.path.exists(full_path)
+        target_is_file = os.path.isfile(full_path)
+    except OSError:
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document save target could not be verified",
+        )
+    if not target_exists:
+        raise _BridgeCommandError(
+            "SAVE_TARGET_MISSING",
+            "Save the document manually in Cinema 4D before using save_document",
+        )
+    if not target_is_file:
+        raise _BridgeCommandError(
+            "SAVE_TARGET_INVALID",
+            "The active document save target is not a regular file",
+        )
+    return normalized_path, document_name, full_path
+
+
+def _save_document(doc):
+    document_path, document_name, full_path = _existing_document_save_target(doc)
+    try:
+        saved = c4d.documents.SaveDocument(
+            doc,
+            full_path,
+            c4d.SAVEDOCUMENTFLAGS_DONTADDTORECENTLIST,
+            c4d.FORMAT_C4DEXPORT,
+        )
+    except Exception:
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D may have modified the document file before save failed",
+        )
+    if saved is not True:
+        raise _BridgeCommandError(
+            "SAVE_FAILED",
+            "Cinema 4D did not verify that the document was saved",
+        )
+    try:
+        target_is_file = os.path.exists(full_path) and os.path.isfile(full_path)
+    except OSError:
+        target_is_file = False
+    if not target_is_file:
+        raise _BridgeCommandError(
+            "OUTCOME_UNKNOWN",
+            "Cinema 4D reported success but the saved file could not be verified",
+        )
+    return {
+        "saved": True,
+        "document": {
+            "name": document_name,
+            "path": document_path,
+            "format": "c4d",
+        },
+    }
+
+
+def _dispatch_save_command(doc, params):
+    try:
+        _validated_command_params("save_document", params)
+    except ValueError as exc:
+        raise _BridgeCommandError("INVALID_PARAMS", str(exc))
+    return _save_document(doc)
+
+
 def _dispatch_mutation_command(command, params):
     try:
         params = _validated_command_params(command, params)
@@ -1512,6 +1642,7 @@ class _MainThreadTask:
         self.state = "queued"
         self.result = None
         self.event = threading.Event()
+        self.start_event = threading.Event()
         self.lock = threading.Lock()
 
     def cancel_if_queued(self):
@@ -1519,6 +1650,7 @@ class _MainThreadTask:
             if self.state != "queued":
                 return False
             self.state = "cancelled"
+            self.start_event.set()
             return True
 
     def cancel_for_shutdown(self):
@@ -1533,6 +1665,7 @@ class _MainThreadTask:
                 "Cinema 4D bridge is stopping",
                 retryable=True,
             )
+            self.start_event.set()
             self.event.set()
             return True
 
@@ -1558,9 +1691,11 @@ class _MainThreadTask:
                         "Cinema 4D bridge is stopping",
                         retryable=True,
                     )
+                    self.start_event.set()
                     self.event.set()
                     return False
                 self.state = "running"
+                self.start_event.set()
 
         try:
             result = self.server._dispatch_on_main_thread(
@@ -1607,6 +1742,7 @@ class C4DSocketServer(threading.Thread):
         request_size_limit=DEFAULT_REQUEST_SIZE_LIMIT,
         client_timeout=DEFAULT_CLIENT_TIMEOUT,
         main_thread_timeout=DEFAULT_MAIN_THREAD_TIMEOUT,
+        save_completion_timeout=DEFAULT_SAVE_COMPLETION_TIMEOUT,
     ):
         super(C4DSocketServer, self).__init__()
         self.host = LOOPBACK_HOST
@@ -1616,6 +1752,7 @@ class C4DSocketServer(threading.Thread):
         self.request_size_limit = int(request_size_limit)
         self.client_timeout = float(client_timeout)
         self.main_thread_timeout = float(main_thread_timeout)
+        self.save_completion_timeout = float(save_completion_timeout)
         self.msg_queue = msg_queue
         self.socket = None
         self.active_client = None
@@ -1632,7 +1769,11 @@ class C4DSocketServer(threading.Thread):
             raise ValueError("port must be between 1 and 65535")
         if self.request_size_limit < 128:
             raise ValueError("request_size_limit must be at least 128 bytes")
-        if self.client_timeout <= 0 or self.main_thread_timeout <= 0:
+        if (
+            self.client_timeout <= 0
+            or self.main_thread_timeout <= 0
+            or self.save_completion_timeout <= 0
+        ):
             raise ValueError("timeouts must be positive")
 
     def log(self, message):
@@ -1919,7 +2060,7 @@ class C4DSocketServer(threading.Thread):
                     _error_envelope(
                         request_id,
                         "UNKNOWN_COMMAND",
-                        "Command is not available in Phase 2B",
+                        "Command is not available in Phase 2C",
                         retryable=False,
                     ),
                 )
@@ -2061,6 +2202,31 @@ class C4DSocketServer(threading.Thread):
         _enqueue_main_thread_message(self.msg_queue, "EXEC", task.execute)
 
         try:
+            if command == "save_document":
+                if not task.start_event.wait(self.main_thread_timeout):
+                    if task.cancel_if_queued():
+                        return _error_envelope(
+                            request_id,
+                            "MAIN_THREAD_TIMEOUT",
+                            "Cinema 4D main thread did not start the request in time",
+                            retryable=False,
+                        )
+                    return _error_envelope(
+                        request_id,
+                        "OUTCOME_UNKNOWN",
+                        "Cinema 4D may have started saving before the timeout",
+                        retryable=False,
+                    )
+                if task.event.is_set():
+                    return task.result
+                if not task.event.wait(self.save_completion_timeout):
+                    return _error_envelope(
+                        request_id,
+                        "OUTCOME_UNKNOWN",
+                        "Cinema 4D began saving but did not finish before the timeout",
+                        retryable=False,
+                    )
+                return task.result
             if not task.event.wait(self.main_thread_timeout):
                 if task.cancel_if_queued():
                     return _error_envelope(
@@ -2116,7 +2282,7 @@ class C4DSocketServer(threading.Thread):
                     "scene_read": True,
                     "object_operations": True,
                     "undo": False,
-                    "save": False,
+                    "save": True,
                     "animation": False,
                     "camera": False,
                     "light": False,
@@ -2136,9 +2302,11 @@ class C4DSocketServer(threading.Thread):
             }
         if command in ("get_scene_info", "list_objects", "get_object"):
             return _dispatch_read_command(command, params, request_id)
+        if command == "save_document":
+            return _dispatch_save_command(_require_active_document(), params)
         if command in WRITE_COMMAND_NAMES:
             return _dispatch_mutation_command(command, params)
-        raise ValueError("unsupported Phase 2B command")
+        raise ValueError("unsupported Phase 2C command")
 
 
 class SocketServerDialog(gui.GeDialog):
@@ -2157,7 +2325,7 @@ class SocketServerDialog(gui.GeDialog):
         self.msg_queue = queue.Queue()
 
     def CreateLayout(self):
-        self.SetTitle("Cinema 4D MCP Phase 2B Bridge")
+        self.SetTitle("Cinema 4D MCP Phase 2C Bridge")
         self.AddStaticText(
             self.STATUS_TEXT_ID,
             c4d.BFH_SCALEFIT,
@@ -2333,6 +2501,6 @@ if __name__ == "__main__":
         PLUGIN_NAME,
         0,
         None,
-        "Secure localhost-only MCP Phase 2B bridge",
+        "Secure localhost-only MCP Phase 2C bridge",
         SocketServerPlugin(),
     )

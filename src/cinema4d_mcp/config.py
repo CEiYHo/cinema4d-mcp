@@ -1,4 +1,4 @@
-"""Fail-closed configuration for the Phase 2B Cinema 4D bridge."""
+"""Fail-closed configuration for the Phase 2C Cinema 4D bridge."""
 
 import math
 import os
@@ -7,10 +7,11 @@ import os
 C4D_HOST = "127.0.0.1"
 DEFAULT_C4D_PORT = 5555
 PROTOCOL_VERSION = 1
-SERVER_VERSION = "0.3.0-phase2b"
+SERVER_VERSION = "0.4.0-phase2c"
 MAX_FRAME_BYTES = 64 * 1024
 CONNECT_TIMEOUT_SECONDS = 2.0
 RESPONSE_TIMEOUT_SECONDS = 5.0
+SAVE_RESPONSE_TIMEOUT_SECONDS = 120.0
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
 TOKEN_MIN_ESTIMATED_ENTROPY_BITS = 128

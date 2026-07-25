@@ -1,4 +1,4 @@
-"""Phase 2B MCP server exposing typed Cinema 4D object mutations."""
+"""Phase 2C MCP server exposing safe Cinema 4D reads, mutations, and saves."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .config import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     RESPONSE_TIMEOUT_SECONDS,
+    SAVE_RESPONSE_TIMEOUT_SECONDS,
     SERVER_VERSION,
     get_c4d_port,
     get_c4d_token,
@@ -36,9 +37,10 @@ ACTIVE_TOOL_NAMES = (
     "create_object",
     "update_object",
     "delete_object",
+    "save_document",
 )
 WRITE_TOOL_NAMES = frozenset(
-    ("create_object", "update_object", "delete_object")
+    ("create_object", "update_object", "delete_object", "save_document")
 )
 CREATE_OBJECT_TYPES = frozenset(
     ("null", "cube", "sphere", "plane", "cylinder", "cone")
@@ -303,6 +305,12 @@ class Cinema4DFastMCP(FastMCP):
     ) -> Any:
         if name in ACTIVE_TOOL_NAMES:
             request_id = uuid.uuid4().hex
+            if not isinstance(arguments, dict):
+                return _error_envelope(
+                    request_id,
+                    "INVALID_PARAMS",
+                    "Tool arguments must be an object",
+                )
             try:
                 _validated_command_params(name, arguments)
             except _CommandValidationError as exc:
@@ -325,9 +333,9 @@ def _post_delivery_failure(
         return _error_envelope(
             request_id,
             "OUTCOME_UNKNOWN",
-            "The mutation may have reached Cinema 4D but no verified response was received",
+            "The write may have reached Cinema 4D but no verified response was received",
             retryable=False,
-            user_action="Inspect the scene before issuing another mutation",
+            user_action="Inspect Cinema 4D before issuing the write again",
         )
     return _error_envelope(
         request_id,
@@ -350,7 +358,7 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "UNKNOWN_COMMAND",
-            "Command is not available in Phase 2B",
+            "Command is not available in Phase 2C",
         )
 
     request_id = request_id or uuid.uuid4().hex
@@ -397,7 +405,12 @@ def send_to_c4d(
             (C4D_HOST, port),
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
-        bridge_socket.settimeout(RESPONSE_TIMEOUT_SECONDS)
+        response_timeout = (
+            SAVE_RESPONSE_TIMEOUT_SECONDS
+            if command == "save_document"
+            else RESPONSE_TIMEOUT_SECONDS
+        )
+        bridge_socket.settimeout(response_timeout)
         delivery_started = True
         bridge_socket.sendall(payload)
 
@@ -411,7 +424,7 @@ def send_to_c4d(
                     "C4D_UNAVAILABLE",
                     "Cinema 4D closed the connection without a response",
                     retryable=True,
-                    user_action="Confirm the Phase 2B bridge is running in Cinema 4D",
+                    user_action="Confirm the Phase 2C bridge is running in Cinema 4D",
                 )
             response_data += chunk
             if len(response_data) > MAX_FRAME_BYTES:
@@ -475,7 +488,7 @@ def send_to_c4d(
                 command,
                 request_id,
                 "C4D_TIMEOUT",
-                "Timed out waiting for the Cinema 4D Phase 2B bridge",
+                "Timed out waiting for the Cinema 4D Phase 2C bridge",
                 retryable=True,
                 user_action="Confirm Cinema 4D is responsive and retry the read",
             )
@@ -502,9 +515,9 @@ def send_to_c4d(
         return _error_envelope(
             request_id,
             "C4D_UNAVAILABLE",
-            "Could not connect to the Cinema 4D Phase 2B bridge",
+            "Could not connect to the Cinema 4D Phase 2C bridge",
             retryable=True,
-            user_action="Start the authenticated Phase 2B bridge in Cinema 4D",
+            user_action="Start the authenticated Phase 2C bridge in Cinema 4D",
         )
     except Exception as exc:
         logger.error(
@@ -543,7 +556,7 @@ async def ping() -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_capabilities() -> Dict[str, Any]:
-    """Report the verified Phase 2B read and typed mutation surface."""
+    """Report the verified Phase 2C read, mutation, and persistence surface."""
     return await asyncio.to_thread(send_to_c4d, "get_capabilities")
 
 
@@ -629,6 +642,12 @@ async def delete_object(
         "delete_object",
         params={"object_id": object_id, "recursive": recursive},
     )
+
+
+@mcp.tool()
+async def save_document() -> Dict[str, Any]:
+    """Save the active document only to its existing native .c4d file."""
+    return await asyncio.to_thread(send_to_c4d, "save_document", params={})
 
 
 mcp_app = mcp

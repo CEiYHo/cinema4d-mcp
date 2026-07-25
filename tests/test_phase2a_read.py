@@ -239,7 +239,7 @@ class Phase2AReadContractTests(unittest.TestCase):
         self.assertTrue(task.execute())
         return task.result
 
-    def test_plugin_allowlist_preserves_reads_and_adds_only_phase2b_mutations(self):
+    def test_plugin_allowlist_preserves_reads_mutations_and_phase2c_save(self):
         expected = (
             "ping",
             "get_capabilities",
@@ -249,11 +249,13 @@ class Phase2AReadContractTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
+            "save_document",
         )
         self.assertEqual(self.plugin.ACTIVE_COMMAND_NAMES, expected)
         self.assertEqual(self.plugin.ALLOWED_COMMANDS, frozenset(expected))
         for forbidden in (
-            "save_document",
+            "save_as",
+            "save_project",
             "save_scene",
             "execute_python",
             "octane_command",

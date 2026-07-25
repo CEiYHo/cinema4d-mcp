@@ -235,7 +235,7 @@ class Phase2BMutationTests(unittest.TestCase):
         request.update(params)
         return self.dispatch("create_object", request)
 
-    def test_plugin_surface_is_exactly_eight_tools(self):
+    def test_plugin_surface_includes_phase2b_tools_and_phase2c_save(self):
         expected = (
             "ping",
             "get_capabilities",
@@ -245,16 +245,20 @@ class Phase2BMutationTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
+            "save_document",
         )
         self.assertEqual(self.plugin.ACTIVE_COMMAND_NAMES, expected)
         self.assertEqual(self.plugin.ALLOWED_COMMANDS, frozenset(expected))
         self.assertEqual(
             self.plugin.WRITE_COMMAND_NAMES,
-            frozenset(("create_object", "update_object", "delete_object")),
+            frozenset(
+                ("create_object", "update_object", "delete_object", "save_document")
+            ),
         )
         for forbidden in (
             "undo_last",
-            "save_document",
+            "save_as",
+            "save_project",
             "execute_python",
             "octane_command",
             "redshift_command",
@@ -869,6 +873,7 @@ class Phase2BExternalTransportTests(unittest.TestCase):
             "create_object",
             "update_object",
             "delete_object",
+            "save_document",
         )
         self.assertEqual(external_server.ACTIVE_TOOL_NAMES, expected)
         self.assertEqual(
@@ -929,11 +934,12 @@ class Phase2BExternalTransportTests(unittest.TestCase):
                     self.assertEqual(response["error"]["code"], code)
         connect.assert_not_called()
 
-    def test_forbidden_phase2c_and_renderer_commands_remain_unknown(self):
+    def test_forbidden_future_persistence_and_renderer_commands_remain_unknown(self):
         with patch("cinema4d_mcp.server.socket.create_connection") as connect:
             for command in (
                 "undo_last",
-                "save_document",
+                "save_as",
+                "save_project",
                 "execute_python",
                 "octane_command",
                 "redshift_command",

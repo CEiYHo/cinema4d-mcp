@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Manual Phase 2B transport certification harness for the C4D bridge.
+"""Manual Phase 2C transport certification harness for the C4D bridge.
 
-Run this only while the Phase 2B plugin is loaded and its server is Online. Each
+Run this only while the Phase 2C plugin is loaded and its server is Online. Each
 case opens a new TCP connection. The token is read from ``C4D_MCP_TOKEN`` and is
 never printed.
 """
@@ -19,7 +19,7 @@ import uuid
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 PROTOCOL_VERSION = 1
-EXPECTED_RUNTIME_VERSION = "0.3.0-phase2b"
+EXPECTED_RUNTIME_VERSION = "0.4.0-phase2c"
 MAX_FRAME_BYTES = 64 * 1024
 TOKEN_MIN_LENGTH = 32
 TOKEN_MAX_LENGTH = 256
@@ -149,8 +149,9 @@ def verify_capabilities(response):
         "create_object",
         "update_object",
         "delete_object",
+        "save_document",
     ]:
-        raise SmokeFailure("capability tool list is not the Phase 2B surface")
+        raise SmokeFailure("capability tool list is not the Phase 2C surface")
 
     cinema4d = result.get("cinema4d") or {}
     if cinema4d.get("version") != "2023.2.2":
@@ -246,7 +247,7 @@ def main():
             "recovery ping after errors",
             exchange(request_frame("ping", token), port),
         )
-        print("Phase 2B transport smoke certification passed")
+        print("Phase 2C transport smoke certification passed")
         return 0
     except (OSError, SmokeFailure, KeyError) as exc:
         print("FAIL {}".format(exc), file=sys.stderr)

@@ -222,7 +222,8 @@ class Phase1TransportContractTests(unittest.TestCase):
     def test_forbidden_commands_are_not_dispatchable(self):
         for command in (
             "undo_last",
-            "save_document",
+            "save_as",
+            "save_project",
             "execute_python",
             "octane_command",
             "redshift_command",
@@ -301,7 +302,7 @@ class Phase1TransportContractTests(unittest.TestCase):
         self.assertEqual(result["cinema4d"]["version"], "2023.2.2")
         self.assertEqual(result["cinema4d"]["version_raw"], 2023202)
         self.assertEqual(result["cinema4d"]["compatibility"], "target")
-        self.assertEqual(result["bridge_version"], "0.3.0-phase2b")
+        self.assertEqual(result["bridge_version"], "0.4.0-phase2c")
         self.assertEqual(
             result["tools"],
             [
@@ -313,16 +314,18 @@ class Phase1TransportContractTests(unittest.TestCase):
                 "create_object",
                 "update_object",
                 "delete_object",
+                "save_document",
             ],
         )
         self.assertTrue(result["features"]["scene_read"])
         self.assertTrue(result["features"]["object_operations"])
         self.assertFalse(result["features"]["undo"])
+        self.assertTrue(result["features"]["save"])
         self.assertTrue(
             all(
                 value is False
                 for name, value in result["features"].items()
-                if name not in ("scene_read", "object_operations")
+                if name not in ("scene_read", "object_operations", "save")
             )
         )
         self.assertFalse(result["renderers"]["octane"]["installed"])
