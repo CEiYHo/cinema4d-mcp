@@ -401,6 +401,21 @@ class Phase2CPersistenceTests(unittest.TestCase):
         release.set()
         callback_worker.join(timeout=0.5)
 
+    def test_external_save_response_timeout_exceeds_bridge_timeout_budget(self):
+        self.assertEqual(
+            self.plugin.DEFAULT_MAIN_THREAD_TIMEOUT,
+            5.0,
+        )
+        self.assertEqual(
+            self.plugin.DEFAULT_SAVE_COMPLETION_TIMEOUT,
+            120.0,
+        )
+        self.assertGreater(
+            SAVE_RESPONSE_TIMEOUT_SECONDS,
+            self.plugin.DEFAULT_MAIN_THREAD_TIMEOUT
+            + self.plugin.DEFAULT_SAVE_COMPLETION_TIMEOUT,
+        )
+
 
 class Phase2CExternalTransportTests(unittest.TestCase):
     def _response(self, request_id="phase2c-external", result=None):
@@ -508,7 +523,7 @@ class Phase2CExternalTransportTests(unittest.TestCase):
         bridge_socket.settimeout.assert_called_once_with(
             SAVE_RESPONSE_TIMEOUT_SECONDS
         )
-        self.assertEqual(SAVE_RESPONSE_TIMEOUT_SECONDS, 120.0)
+        self.assertEqual(SAVE_RESPONSE_TIMEOUT_SECONDS, 130.0)
         bridge_socket.sendall.assert_called_once()
         sent = json.loads(
             bridge_socket.sendall.call_args.args[0].decode("utf-8")
